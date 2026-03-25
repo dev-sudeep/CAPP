@@ -1,0 +1,1 @@
+rm $HOME/bin/Chello

@@ -1,0 +1,1 @@
+After installation, run Chello in terminal to get a friendly greeting
