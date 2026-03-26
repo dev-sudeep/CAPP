@@ -103,7 +103,6 @@ int main(void) {
 #endif
 
     printf("\n[bundler] Success! Bundle created: %s\n", out_file);
-    printf("[bundler] To install: unzip '%s' and run install.sh\n", out_file);
 
     return 0;
 }
