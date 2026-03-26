@@ -136,3 +136,6 @@ Before executing any install or uninstall script, CAPP prints the full script
 contents to the terminal and requires explicit confirmation. **Always read the
 script carefully** before typing `y`. If anything looks suspicious, type `N` to
 abort — no changes will be made to your system.
+
+## License
+MIT License
