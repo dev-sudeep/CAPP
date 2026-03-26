@@ -1,8 +1,8 @@
 # CAPP — Compact App: A Simple App Bundle Utility
 
 CAPP (Compact App) packages an application and its install/uninstall logic
-into a single `.capp` file (a renamed ZIP archive). The toolchain consists of
-three C programs: **bundler**, **capp-install**, and **capp-uninstall**.
+into a single `.capp` file (a renamed ZIP archive). The toolchain consists of a single C program 
+having 3 subcommands: **capp create**, **capp install** and **capp uninstall**.
 
 ---
 
@@ -33,9 +33,9 @@ MyApp.capp  (ZIP archive containing:)
 ### Method 2 — Using the Bundler
 
 1. Place all required files in a folder.
-2. Compile and run `bundler`:
+2. Compile `capp` and run `capp create`:
    ```sh
-   ./bundler
+   capp create
    ```
 3. Enter the path to the source folder when prompted.
 4. Enter the application name (without `.capp`) when prompted.
@@ -46,7 +46,7 @@ MyApp.capp  (ZIP archive containing:)
 ## Installing a Bundle
 
 ```sh
-capp-install MyApp.capp
+capp install MyApp.capp
 ```
 
 The installer performs these steps in order:
@@ -68,9 +68,9 @@ After installation the original `.capp` file is moved — it lives at
 ## Uninstalling a Bundle
 
 ```sh
-capp-uninstall MyApp
+capp uninstall MyApp
 # or equivalently:
-capp-uninstall MyApp.capp
+capp uninstall MyApp.capp
 ```
 
 The uninstaller looks up the stored bundle in `~/.capp/bundles/` automatically —
@@ -92,19 +92,14 @@ you do not need to supply a file path. It performs these steps:
 
 ## Building from Source
 
-All three programs are single-file C99 with no external dependencies beyond a
+The programs is single-file C99 with no external dependencies beyond a
 C standard library and the platform's `zip`/`unzip` utilities.
 
 ```sh
 # Linux / macOS
-gcc -o bundler        bundler.c
-gcc -o capp-install   install.c
-gcc -o capp-uninstall uninstall.c
-
+gcc -o capp capp.c
 # Windows (MinGW / MSYS2)
-gcc -o bundler.exe        bundler.c
-gcc -o capp-install.exe   install.c
-gcc -o capp-uninstall.exe uninstall.c
+gcc -o capp.exe capp.c
 ```
 
 ### Runtime dependencies
