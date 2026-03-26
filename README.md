@@ -1,8 +1,8 @@
-# CAPP — A Simple App Bundle Utility
+# CAPP — Compact App: A Simple App Bundle Utility
 
-CAPP packages an application and its install/uninstall logic into a single
-`.capp` file (a renamed ZIP archive). The toolchain consists of three C
-programs: **bundler**, **capp-install**, and **capp-uninstall**.
+CAPP (Compact App) packages an application and its install/uninstall logic
+into a single `.capp` file (a renamed ZIP archive). The toolchain consists of
+three C programs: **bundler**, **capp-install**, and **capp-uninstall**.
 
 ---
 
@@ -12,7 +12,7 @@ programs: **bundler**, **capp-install**, and **capp-uninstall**.
 MyApp.capp  (ZIP archive containing:)
 ├── install.sh / install.bat     — runs on installation
 ├── uninstall.sh / uninstall.bat — runs on uninstallation
-├── instructions.txt             — usage documentation
+├── instructions.<ext>           — usage documentation
 ├── <main file>                  — source code, binary, etc.
 └── <anything else>
 ```
@@ -136,6 +136,3 @@ Before executing any install or uninstall script, CAPP prints the full script
 contents to the terminal and requires explicit confirmation. **Always read the
 script carefully** before typing `y`. If anything looks suspicious, type `N` to
 abort — no changes will be made to your system.
-
-## License
-MIT License
