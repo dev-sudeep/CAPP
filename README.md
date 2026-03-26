@@ -12,7 +12,7 @@ programs: **bundler**, **capp-install**, and **capp-uninstall**.
 MyApp.capp  (ZIP archive containing:)
 ├── install.sh / install.bat     — runs on installation
 ├── uninstall.sh / uninstall.bat — runs on uninstallation
-├── instructions.<ext>           — usage documentation
+├── instructions.txt             — usage documentation
 ├── <main file>                  — source code, binary, etc.
 └── <anything else>
 ```
