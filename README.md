@@ -18,7 +18,7 @@ MyApp.capp  (ZIP archive containing:)
 ```
 
 > **Note:** `.sh` scripts are used on Linux and macOS; `.bat` scripts are used
-> on Windows. The bundler and installer select the correct variant automatically
+> on Windows. The installer selects the correct variant automatically
 > at compile time.
 
 ---
