@@ -132,6 +132,88 @@ static void strip_trailing_sep(char *s) {
         s[--len] = '\0';
 }
 
+/* Check if an app is listed in installed.txt */
+static int is_app_installed(const char *app_name) {
+    char bundles_dir[MAX_PATH];
+    if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 0;
+
+    char installed_path[MAX_PATH];
+    snprintf(installed_path, sizeof(installed_path), "%s%sinstalled.txt",
+             bundles_dir, PATH_SEP);
+
+    FILE *f = fopen(installed_path, "r");
+    if (!f) return 0;
+
+    char line[MAX_PATH];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, app_name) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/* Add an app to installed.txt */
+static void add_to_installed(const char *app_name) {
+    char bundles_dir[MAX_PATH];
+    if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return;
+
+    char installed_path[MAX_PATH];
+    snprintf(installed_path, sizeof(installed_path), "%s%sinstalled.txt",
+             bundles_dir, PATH_SEP);
+
+    FILE *f = fopen(installed_path, "a");
+    if (!f) {
+        fprintf(stderr, "[capp] Warning: Could not update installed.txt.\n");
+        return;
+    }
+    fprintf(f, "%s\n", app_name);
+    fclose(f);
+}
+
+/* Remove an app from installed.txt */
+static void remove_from_installed(const char *app_name) {
+    char bundles_dir[MAX_PATH];
+    if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return;
+
+    char installed_path[MAX_PATH];
+    snprintf(installed_path, sizeof(installed_path), "%s%sinstalled.txt",
+             bundles_dir, PATH_SEP);
+
+    char temp_path[MAX_PATH];
+    snprintf(temp_path, sizeof(temp_path), "%s%sinstalled.txt.tmp",
+             bundles_dir, PATH_SEP);
+
+    FILE *in = fopen(installed_path, "r");
+    if (!in) return;
+
+    FILE *out = fopen(temp_path, "w");
+    if (!out) {
+        fclose(in);
+        fprintf(stderr, "[capp] Warning: Could not update installed.txt.\n");
+        return;
+    }
+
+    char line[MAX_PATH];
+    while (fgets(line, sizeof(line), in)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, app_name) != 0)
+            fprintf(out, "%s\n", line);
+    }
+
+    fclose(in);
+    fclose(out);
+
+    char cmd[MAX_CMD];
+    snprintf(cmd, sizeof(cmd), MOVE_CMD, temp_path, installed_path);
+    if (system(cmd) != 0)
+        fprintf(stderr, "[capp] Warning: Could not update installed.txt.\n");
+}
+
 /* ── Executable / binary detection ────────────────────────────────────────── */
 
 /* Known plain-text extensions */
@@ -508,6 +590,9 @@ static int cmd_install(const char *bundle) {
         fprintf(stderr, "         You may need to move '%s' manually.\n", bundle);
     }
 
+    /* Step 8: Add to installed.txt */
+    add_to_installed(app_name);
+
     printf("[capp] Installation complete!\n");
     printf("[capp] To uninstall, run: capp uninstall %s\n", app_name);
     return 0;
@@ -538,7 +623,24 @@ static int cmd_uninstall(const char *arg) {
     printf("[capp] App    : %s\n", app_name);
     printf("[capp] Bundle : %s\n\n", bundle_path);
 
-    /* Step 1: Confirm */
+    /* Step 1: Verify app is installed */
+    if (!is_app_installed(app_name)) {
+        fprintf(stderr, "Error: '%s' is not installed.\n", app_name);
+        fprintf(stderr, "       (Not found in installed.txt)\n");
+        return 1;
+    }
+
+    /* Step 2: Verify bundle file exists */
+    FILE *test = fopen(bundle_path, "rb");
+    if (!test) {
+        fprintf(stderr, "Error: Bundle not found at '%s'.\n", bundle_path);
+        fprintf(stderr, "       The app is registered but the bundle file is missing.\n");
+        fprintf(stderr, "       You may need to manually clean up installed files.\n");
+        return 1;
+    }
+    fclose(test);
+
+    /* Step 3: Confirm */
     {
         char answer[8];
         printf("[capp] Are you sure you want to uninstall '%s'? [y/N]: ", app_name);
@@ -551,16 +653,7 @@ static int cmd_uninstall(const char *arg) {
         }
     }
 
-    /* Step 2: Verify bundle exists */
-    FILE *test = fopen(bundle_path, "rb");
-    if (!test) {
-        fprintf(stderr, "\nError: Bundle not found at '%s'.\n", bundle_path);
-        fprintf(stderr, "       Is '%s' installed?\n", app_name);
-        return 1;
-    }
-    fclose(test);
-
-    /* Step 3: Extract */
+    /* Step 4: Extract */
     snprintf(cmd, sizeof(cmd), UNZIP_CMD, bundle_path, extract_dir);
     printf("\n[capp] Extracting bundle...\n");
     if (system(cmd) != 0) {
@@ -568,7 +661,7 @@ static int cmd_uninstall(const char *arg) {
         return 1;
     }
 
-    /* Step 4: Review uninstall script */
+    /* Step 5: Review uninstall script */
     if (!review_script(extract_dir, UNINSTALL_SCRIPT)) {
         printf("[capp] Uninstallation aborted by user.\n");
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
@@ -576,7 +669,7 @@ static int cmd_uninstall(const char *arg) {
         return 1;
     }
 
-    /* Step 5: Run uninstall script */
+    /* Step 6: Run uninstall script */
     snprintf(cmd, sizeof(cmd), RUN_UNINSTALL, extract_dir);
     printf("[capp] Running uninstall script...\n");
     int ret = system(cmd);
@@ -587,16 +680,19 @@ static int cmd_uninstall(const char *arg) {
         return 1;
     }
 
-    /* Step 6: Clean up temp dir */
+    /* Step 7: Clean up temp dir */
     printf("[capp] Cleaning up...\n");
     snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
     system(cmd);
 
-    /* Step 7: Remove stored bundle */
+    /* Step 8: Remove stored bundle */
     snprintf(cmd, sizeof(cmd), REMOVE_FILE_CMD, bundle_path);
     printf("[capp] Removing stored bundle...\n");
     if (system(cmd) != 0)
         fprintf(stderr, "Warning: Could not remove bundle '%s'.\n", bundle_path);
+
+    /* Step 9: Remove from installed.txt */
+    remove_from_installed(app_name);
 
     printf("[capp] '%s' has been uninstalled.\n", app_name);
     return 0;
