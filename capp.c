@@ -24,6 +24,7 @@
   #define PATH_SEP          "\\"
   #define HOME_ENV          "USERPROFILE"
   #define BUNDLES_SUBDIR    "\\.capp\\bundles"
+  #define BIN_SUBDIR        "\\.capp\\bin"
 
   /* create */
   #define ZIP_CMD           "powershell -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force\""
@@ -51,6 +52,7 @@
   #define PATH_SEP          "/"
   #define HOME_ENV          "HOME"
   #define BUNDLES_SUBDIR    "/.capp/bundles"
+  #define BIN_SUBDIR        "/.capp/bin"
 
   /* create */
   #ifdef __APPLE__
@@ -122,6 +124,17 @@ static int get_bundles_dir(char *out, size_t out_sz) {
         return 0;
     }
     snprintf(out, out_sz, "%s%s", home, BUNDLES_SUBDIR);
+    return 1;
+}
+
+/* Populate out with the path to ~/.capp/bin */
+static int get_bin_dir(char *out, size_t out_sz) {
+    const char *home = getenv(HOME_ENV);
+    if (!home || strlen(home) == 0) {
+        fprintf(stderr, "Error: $" HOME_ENV " is not set.\n");
+        return 0;
+    }
+    snprintf(out, out_sz, "%s%s", home, BIN_SUBDIR);
     return 1;
 }
 
@@ -527,6 +540,8 @@ static int cmd_install(const char *bundle) {
 
     char bundles_dir[MAX_PATH];
     if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
+    char bin_dir[MAX_PATH];
+    if (!get_bin_dir(bin_dir, sizeof(bin_dir))) return 1;
 
     char cmd[MAX_CMD];
 
@@ -534,7 +549,19 @@ static int cmd_install(const char *bundle) {
     printf("[capp] Bundle   : %s\n", bundle);
     printf("[capp] App name : %s\n\n", app_name);
 
-    /* Step 1: Extract */
+    /* Step 1: Ensure ~/.capp/{bundles,bin}/ exists */
+    snprintf(cmd, sizeof(cmd), MKDIR_CMD, bundles_dir);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Error: Could not create bundles directory '%s'.\n", bundles_dir);
+        return 1;
+    }
+    snprintf(cmd, sizeof(cmd), MKDIR_CMD, bin_dir);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Error: Could not create executable directory '%s'.\n", bin_dir);
+        return 1;
+    }
+
+    /* Step 2: Extract */
     snprintf(cmd, sizeof(cmd), UNZIP_CMD, bundle, extract_dir);
     printf("[capp] Extracting bundle...\n");
     if (system(cmd) != 0) {
@@ -542,7 +569,7 @@ static int cmd_install(const char *bundle) {
         return 1;
     }
 
-    /* Step 2: Review install script */
+    /* Step 3: Review install script */
     if (!review_script(extract_dir, INSTALL_SCRIPT)) {
         printf("[capp] Installation aborted by user.\n");
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
@@ -550,7 +577,7 @@ static int cmd_install(const char *bundle) {
         return 1;
     }
 
-    /* Step 3: Run install script */
+    /* Step 4: Run install script */
     snprintf(cmd, sizeof(cmd), RUN_INSTALL, extract_dir);
     printf("[capp] Running install script...\n");
     int ret = system(cmd);
@@ -561,26 +588,14 @@ static int cmd_install(const char *bundle) {
         return 1;
     }
 
-    /* Step 4: Open instructions */
+    /* Step 5: Open instructions */
     if (open_instructions(extract_dir) != 0) {
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
         system(cmd);
         return 1;
     }
 
-    /* Step 5: Clean up temp dir */
-    printf("[capp] Cleaning up...\n");
-    snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
-    system(cmd);
-
-    /* Step 6: Ensure ~/.capp/bundles/ exists */
-    snprintf(cmd, sizeof(cmd), MKDIR_CMD, bundles_dir);
-    if (system(cmd) != 0) {
-        fprintf(stderr, "Error: Could not create bundles directory '%s'.\n", bundles_dir);
-        return 1;
-    }
-
-    /* Step 7: Move bundle to ~/.capp/bundles/ */
+    /* Step 6: Move bundle to ~/.capp/bundles/ */
     char dest_path[MAX_PATH];
     snprintf(dest_path, sizeof(dest_path), "%s%s%s.capp", bundles_dir, PATH_SEP, app_name);
     snprintf(cmd, sizeof(cmd), MOVE_CMD, bundle, dest_path);
@@ -590,11 +605,23 @@ static int cmd_install(const char *bundle) {
         fprintf(stderr, "         You may need to move '%s' manually.\n", bundle);
     }
 
-    /* Step 8: Add to installed.txt */
+    /* Step 7: Add to installed.txt */
     add_to_installed(app_name);
+
+    /* Step 8: Clean up temp dir */
+    printf("[capp] Cleaning up...\n");
+    snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Warning: Could not remove temporary directory '%s'.\n", extract_dir);
+    }
 
     printf("[capp] Installation complete!\n");
     printf("[capp] To uninstall, run: capp uninstall %s\n", app_name);
+#ifdef _WIN32
+    printf("[capp] Add '%s' to PATH in your PowerShell profile ($PROFILE).\n", bin_dir);
+#else
+    printf("[capp] Add '%s' to PATH in your ~/.bashrc.\n", bin_dir);
+#endif
     return 0;
 }
 
