@@ -1,1 +1,1 @@
-del "%USERPROFILE%\bin\Chello.exe"
+del "%USERPROFILE%\.capp\bin\Chello.exe"

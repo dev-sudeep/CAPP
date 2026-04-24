@@ -51,14 +51,18 @@ capp install MyApp.capp
 
 The installer performs these steps in order:
 
-1. **Extracts** the `.capp` archive to a temporary directory.
-2. **Displays** the full contents of `install.sh` (or `install.bat` on Windows).
-3. **Prompts** you to review the script for anything suspicious and confirm
+1. **Creates** `~/.capp/bundles/` and `~/.capp/bin/` (Windows:
+   `%USERPROFILE%\.capp\bundles\` and `%USERPROFILE%\.capp\bin\`) if needed.
+2. **Extracts** the `.capp` archive to a temporary directory.
+3. **Displays** the full contents of `install.sh` (or `install.bat` on Windows).
+4. **Prompts** you to review the script for anything suspicious and confirm
    before proceeding (`[y/N]`). Entering anything other than `y` aborts cleanly.
-4. **Runs** the install script.
-5. **Cleans up** the temporary extraction directory.
+5. **Runs** the install script.
 6. **Stores** the `.capp` bundle in `~/.capp/bundles/` (Windows:
    `%USERPROFILE%\.capp\bundles\`) for later use by the uninstaller.
+7. **Cleans up** the temporary extraction directory.
+8. **Prompts** you to add `~/.capp/bin` to your PATH (`~/.bashrc` on Linux/macOS,
+   PowerShell `$PROFILE` on Windows).
 
 After installation the original `.capp` file is moved — it lives at
 `~/.capp/bundles/MyApp.capp`.
@@ -112,16 +116,16 @@ gcc -o capp.exe capp.c
 
 ---
 
-## Bundle Storage
+## Bundle and Executable Storage
 
-Installed bundles are kept at:
+Installed bundles and app executables are kept at:
 
-| Platform | Path                              |
-|----------|-----------------------------------|
-| Linux / macOS | `~/.capp/bundles/`           |
-| Windows  | `%USERPROFILE%\.capp\bundles\`    |
+| Platform | Bundles Path | Executables Path |
+|----------|---------------|------------------|
+| Linux / macOS | `~/.capp/bundles/` | `~/.capp/bin/` |
+| Windows  | `%USERPROFILE%\.capp\bundles\` | `%USERPROFILE%\.capp\bin\` |
 
-This directory is created automatically on first install.
+These directories are created automatically on first install.
 
 ---
 

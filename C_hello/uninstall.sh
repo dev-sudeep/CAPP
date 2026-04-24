@@ -1,3 +1,3 @@
-if [ -f "$HOME/bin/Chello" ]; then
-    rm "$HOME/bin/Chello"
+if [ -f "$HOME/.capp/bin/Chello" ]; then
+    rm "$HOME/.capp/bin/Chello"
 fi

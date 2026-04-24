@@ -1,1 +1,2 @@
-After installation, run Chello in terminal to get a friendly greeting
+After installation, run Chello in terminal to get a friendly greeting.
+The executable is installed to ~/.capp/bin (or %USERPROFILE%\.capp\bin on Windows).
