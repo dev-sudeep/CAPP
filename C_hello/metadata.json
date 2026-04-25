@@ -1,0 +1,7 @@
+{
+	"name" : "C_hello",
+	"version" : "1.0.0",
+	"author" : "dev-sudeep",
+	"description" : "A C program to get a friendly greeting in the terminal!"
+	
+}
