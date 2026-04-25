@@ -1,14 +1,15 @@
 /*
- * capp.c - Compact App (CAPP) utility
+ * capp.c - Compact App (CAPP) utility with mirror support
  *
  * Compile:
  *   Linux/macOS : gcc -o capp capp.c
  *   Windows     : gcc -o capp.exe capp.c
  *
  * Usage:
- *   capp create                    — interactively bundle a folder into a .capp
- *   capp install   <App.capp>      — install a bundle
- *   capp uninstall <AppName>       — uninstall a previously installed app
+ *   capp create                              — interactively bundle a folder into a .capp
+ *   capp install   <App.capp>                — install a bundle from local file
+ *   capp install-remote <AppName> <Version> — install a bundle from mirror
+ *   capp uninstall <AppName>                 — uninstall a previously installed app
  */
 
 #include <stdio.h>
@@ -82,6 +83,31 @@
 #define MAX_CMD   1024
 #define SAMPLE_BYTES 512
 
+/* ── Mirror configuration ──────────────────────────────────────────────────── */
+
+typedef struct {
+    char url[MAX_PATH];
+} Mirror;
+
+/* Default mirrors - user can override via env var or config file */
+static Mirror DEFAULT_MIRRORS[] = {
+    {"https://raw.githubusercontent.com/dev-sudeep/CAPP-mirror/refs/heads/main"},
+    {""} /* sentinel */
+};
+
+/* Get mirror URLs from environment or defaults */
+static Mirror* get_mirrors(void) {
+    const char *mirror_env = getenv("CAPP_MIRROR");
+    if (mirror_env && strlen(mirror_env) > 0) {
+        Mirror *mirrors = malloc(2 * sizeof(Mirror));
+        strncpy(mirrors[0].url, mirror_env, MAX_PATH - 1);
+        mirrors[0].url[MAX_PATH - 1] = '\0';
+        mirrors[1].url[0] = '\0';
+        return mirrors;
+    }
+    return DEFAULT_MIRRORS;
+}
+
 /* ── Shared helpers ────────────────────────────────────────────────────────── */
 
 /* Extract the filename portion of a path */
@@ -135,6 +161,33 @@ static int get_bin_dir(char *out, size_t out_sz) {
         return 0;
     }
     snprintf(out, out_sz, "%s%s", home, BIN_SUBDIR);
+    return 1;
+}
+
+/* Populate out with the path to ~/.capp/cache */
+static int get_cache_dir(char *out, size_t out_sz) {
+    const char *home = getenv(HOME_ENV);
+    if (!home || strlen(home) == 0) {
+        fprintf(stderr, "Error: $" HOME_ENV " is not set.\n");
+        return 0;
+    }
+#ifdef _WIN32
+    snprintf(out, out_sz, "%s\\.capp\\cache", home);
+#else
+    snprintf(out, out_sz, "%s/.capp/cache", home);
+#endif
+    return 1;
+}
+
+/* Populate out with the path to the app's cache directory */
+static int get_app_cache_dir(const char *app_name, char *out, size_t out_sz) {
+    char cache_dir[MAX_PATH];
+    if (!get_cache_dir(cache_dir, sizeof(cache_dir))) return 0;
+#ifdef _WIN32
+    snprintf(out, out_sz, "%s\\%s", cache_dir, app_name);
+#else
+    snprintf(out, out_sz, "%s/%s", cache_dir, app_name);
+#endif
     return 1;
 }
 
@@ -258,16 +311,6 @@ static int is_binary_file(const char *path) {
 /*
  * Returns 1 if the file is an executable binary or runnable script.
  * Detection uses magic bytes and shebang — never permission bits.
- *
- *   ELF binary        : 0x7f 'E' 'L' 'F'
- *   Windows PE        : 'M' 'Z'
- *   Mach-O 32-bit     : 0xCE 0xFA 0xED 0xFE
- *   Mach-O 64-bit     : 0xCF 0xFA 0xED 0xFE
- *   Mach-O fat        : 0xCA 0xFE 0xBA 0xBE
- *   Shebang script    : '#' '!'
- *   PowerShell        : .ps1 .psm1 .psd1  (extension, no magic byte)
- *   Windows scripts   : .bat .cmd         (extension, no magic byte)
- *   Windows launchers : .exe .com .msi .scr .pif
  */
 static int is_executable_file(const char *path) {
     unsigned char buf[SAMPLE_BYTES] = {0};
@@ -304,8 +347,6 @@ static int is_executable_file(const char *path) {
 
 /*
  * Remove all execute permission bits from path before the OS opens it.
- * Unix : chmod a-x via syscall.
- * Windows : icacls /deny Everyone Execute.
  */
 static void strip_exec_permissions(const char *path) {
 #ifdef _WIN32
@@ -366,11 +407,15 @@ static int review_script(const char *extract_dir, const char *script_name) {
 /*
  * Search extract_dir for instructions.<ext>.
  * Aborts (returns -1) if the file is an executable or script.
- * Otherwise opens it with the platform viewer, or cats it on Linux as fallback.
+ * Copies the file to cache directory so it persists after extraction cleanup.
+ * Otherwise opens it with the platform viewer.
  * Returns 0 on success or when no instructions file exists.
  */
-static int open_instructions(const char *extract_dir) {
+static int open_instructions(const char *extract_dir, const char *app_name) {
     char found_path[MAX_PATH];
+    char cache_dir[MAX_PATH];
+    char cached_path[MAX_PATH];
+    char cmd[MAX_CMD];
     found_path[0] = '\0';
 
 #ifdef _WIN32
@@ -415,26 +460,43 @@ static int open_instructions(const char *extract_dir) {
 
     strip_exec_permissions(found_path);
 
+    /* Create cache directory and copy instructions there */
+    if (!get_app_cache_dir(app_name, cache_dir, sizeof(cache_dir))) return 0;
+    
+    snprintf(cmd, sizeof(cmd), MKDIR_CMD, cache_dir);
+    system(cmd);
+    
+    snprintf(cached_path, sizeof(cached_path), "%s%s%s", 
+             cache_dir, PATH_SEP, basename_of(found_path));
+    
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "copy /Y \"%s\" \"%s\" > nul", found_path, cached_path);
+#else
+    snprintf(cmd, sizeof(cmd), "cp '%s' '%s'", found_path, cached_path);
+#endif
+    
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[capp] Warning: Could not cache instructions file.\n");
+        return 0;
+    }
+
 #if defined(_WIN32) || defined(__APPLE__)
-    char cmd[MAX_CMD];
-    snprintf(cmd, sizeof(cmd), OPEN_CMD, found_path);
+    snprintf(cmd, sizeof(cmd), OPEN_CMD, cached_path);
     printf("[capp] Opening instructions...\n");
     system(cmd);
 #else
     if (system("which xdg-open > /dev/null 2>&1") == 0) {
-        char cmd[MAX_CMD];
-        snprintf(cmd, sizeof(cmd), OPEN_CMD, found_path);
-        printf("[capp] Opening instructions with xdg-open...\n");
+        snprintf(cmd, sizeof(cmd), OPEN_CMD, cached_path);
+        printf("[capp] Opening instructions...\n");
         system(cmd);
     } else {
         printf("[capp] xdg-open not found.\n");
-        if (!is_text_ext(basename_of(found_path)) || is_binary_file(found_path)) {
+        if (!is_text_ext(basename_of(cached_path)) || is_binary_file(cached_path)) {
             printf("[capp] Instructions file is not a displayable text format.\n");
         } else {
-            const char *name = basename_of(found_path);
+            const char *name = basename_of(cached_path);
             printf("[capp] ---- Contents of %s ----\n\n", name);
-            char cmd[MAX_CMD];
-            snprintf(cmd, sizeof(cmd), CAT_CMD, found_path);
+            snprintf(cmd, sizeof(cmd), CAT_CMD, cached_path);
             system(cmd);
             printf("\n[capp] ---- End of %s ----\n", name);
         }
@@ -442,6 +504,228 @@ static int open_instructions(const char *extract_dir) {
 #endif
 
     return 0;
+}
+
+/* ── Mirror support: fetch packages.txt ────────────────────────────────────── */
+
+/*
+ * Version structure for semantic versioning
+ */
+typedef struct {
+    int major;
+    int minor;
+    int patch;
+} VersionParts;
+
+/*
+ * Parse a version string into parts.
+ * Handles formats like: 1.2.3, 1.2, 1
+ * Returns the parsed version.
+ */
+static VersionParts parse_version(const char *version_str) {
+    VersionParts v = {0, 0, 0};
+    sscanf(version_str, "%d.%d.%d", &v.major, &v.minor, &v.patch);
+    return v;
+}
+
+/*
+ * Compare two versions.
+ * Returns: > 0 if v1 > v2, 0 if equal, < 0 if v1 < v2
+ */
+static int compare_versions(const char *v1_str, const char *v2_str) {
+    VersionParts v1 = parse_version(v1_str);
+    VersionParts v2 = parse_version(v2_str);
+    
+    if (v1.major != v2.major) return v1.major - v2.major;
+    if (v1.minor != v2.minor) return v1.minor - v2.minor;
+    if (v1.patch != v2.patch) return v1.patch - v2.patch;
+    return 0;
+}
+
+/*
+ * Package info structure
+ */
+typedef struct {
+    char *version;
+    char *filename;
+} PackageInfo;
+
+/*
+ * Parse packages.txt and find a package matching name.
+ * If pkg_version is NULL, returns the latest (highest) version.
+ * If pkg_version is specified, returns that specific version.
+ * Format: name|version|filename
+ * Returns a struct with version, filename, or NULL on failure.
+ * Caller must free the returned struct and its members.
+ */
+static PackageInfo* find_package_in_list(const char *packages_txt, 
+                                         const char *pkg_name,
+                                         const char *pkg_version) {
+    char *list_copy = malloc(strlen(packages_txt) + 1);
+    strcpy(list_copy, packages_txt);
+    
+    PackageInfo *best_match = NULL;
+    char *line = strtok(list_copy, "\n");
+    
+    while (line) {
+        char name[256], version[256], filename[256];
+        
+        /* Parse the pipe-delimited line */
+        if (sscanf(line, "%255[^|]|%255[^|]|%255s",
+                   name, version, filename) >= 3) {
+            
+            /* If specific version requested, find exact match */
+            if (pkg_version) {
+                if (strcmp(name, pkg_name) == 0 && strcmp(version, pkg_version) == 0) {
+                    if (best_match) {
+                        free(best_match->version);
+                        free(best_match->filename);
+                        free(best_match);
+                    }
+                    best_match = malloc(sizeof(PackageInfo));
+                    best_match->version = malloc(strlen(version) + 1);
+                    best_match->filename = malloc(strlen(filename) + 1);
+                    strcpy(best_match->version, version);
+                    strcpy(best_match->filename, filename);
+                    break; /* Found exact match, stop searching */
+                }
+            } else {
+                /* No specific version: find latest (highest version number) */
+                if (strcmp(name, pkg_name) == 0) {
+                    if (!best_match || compare_versions(version, best_match->version) > 0) {
+                        if (best_match) {
+                            free(best_match->version);
+                            free(best_match->filename);
+                            free(best_match);
+                        }
+                        best_match = malloc(sizeof(PackageInfo));
+                        best_match->version = malloc(strlen(version) + 1);
+                        best_match->filename = malloc(strlen(filename) + 1);
+                        strcpy(best_match->version, version);
+                        strcpy(best_match->filename, filename);
+                    }
+                }
+            }
+        }
+        line = strtok(NULL, "\n");
+    }
+    
+    free(list_copy);
+    return best_match;
+}
+
+/*
+ * Fetch packages.txt from a mirror URL.
+ * Returns the file contents as a string, or NULL on failure.
+ * Caller must free the returned string.
+ */
+static char* fetch_packages_list(const char *mirror_url) {
+    char curl_url[MAX_PATH];
+    char temp_file[MAX_PATH];
+    char temp_dir[MAX_PATH];
+    char cmd[MAX_CMD];
+    
+    /* Get home directory - works on Linux, macOS, Android Termux, Windows */
+    const char *home = getenv(HOME_ENV);
+    if (!home) home = ".";
+    
+#ifdef _WIN32
+    snprintf(temp_dir, sizeof(temp_dir), "%s\\.capp", home);
+    snprintf(temp_file, sizeof(temp_file), "%s\\.capp\\packages.tmp", home);
+#else
+    snprintf(temp_dir, sizeof(temp_dir), "%s/.capp", home);
+    snprintf(temp_file, sizeof(temp_file), "%s/.capp/packages.tmp", home);
+#endif
+    
+    /* Create temp directory if it doesn't exist */
+    snprintf(cmd, sizeof(cmd), MKDIR_CMD, temp_dir);
+    system(cmd);
+    
+    /* Check if curl exists */
+    if (system("curl --version > /dev/null 2>&1") != 0) {
+        fprintf(stderr, "[capp] Error: curl is not installed.\n");
+        return NULL;
+    }
+    
+    snprintf(curl_url, sizeof(curl_url), "%s/packages.txt", mirror_url);
+    snprintf(cmd, sizeof(cmd), "curl -s -o '%s' '%s'", temp_file, curl_url);
+    
+    printf("[capp] Fetching package list from: %s\n", mirror_url);
+    
+    int curl_ret = system(cmd);
+    
+    if (curl_ret != 0) {
+        fprintf(stderr, "[capp] Error: Failed to fetch from mirror. Check your internet connection.\n");
+        return NULL;
+    }
+    
+    /* Read the file */
+    FILE *f = fopen(temp_file, "r");
+    if (!f) {
+        fprintf(stderr, "[capp] Error: Could not read downloaded file.\n");
+        return NULL;
+    }
+    
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (size == 0) {
+        fprintf(stderr, "[capp] Error: Downloaded file is empty. Mirror may be unreachable or packages.txt doesn't exist.\n");
+        fclose(f);
+        return NULL;
+    }
+    
+    char *content = malloc(size + 1);
+    size_t read = fread(content, 1, size, f);
+    fclose(f);
+    
+    content[read] = '\0';
+    
+    /* Check for HTTP error in content */
+    if (strncmp(content, "<!DOCTYPE", 9) == 0 || 
+        strncmp(content, "<html", 5) == 0 ||
+        strstr(content, "404") != NULL ||
+        strstr(content, "400") != NULL ||
+        strstr(content, "403") != NULL ||
+        strstr(content, "500") != NULL) {
+        fprintf(stderr, "[capp] Error: HTTP error from mirror (file not found or server error).\n");
+        free(content);
+        return NULL;
+    }
+    
+    /* Clean up temp file */
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "del /f /q \"%s\"", temp_file);
+#else
+    snprintf(cmd, sizeof(cmd), "rm -f '%s'", temp_file);
+#endif
+    system(cmd);
+    
+    return content;
+}
+
+/*
+ * Download a .capp file from mirror to local path.
+ */
+static int download_capp_file(const char *mirror_url,
+                               const char *filename,
+                               const char *dest_path) {
+    char curl_url[MAX_PATH];
+    char cmd[MAX_CMD];
+    
+    snprintf(curl_url, sizeof(curl_url), "%s/packages/%s", mirror_url, filename);
+    snprintf(cmd, sizeof(cmd), "curl -s -f -o '%s' '%s'", dest_path, curl_url);
+    
+    printf("[capp] Downloading: %s\n", filename);
+    int ret = system(cmd);
+    
+    if (ret != 0) {
+        fprintf(stderr, "[capp] Failed to download from: %s\n", mirror_url);
+        return 0;
+    }
+    
+    return 1;
 }
 
 /* ── Subcommand: create ────────────────────────────────────────────────────── */
@@ -520,8 +804,7 @@ static int cmd_install(const char *bundle) {
     char app_name[MAX_PATH];
     make_app_name(bundle, app_name, sizeof(app_name));
 
-    /* Resolve extract_dir to an absolute path before the directory exists,
-     * so xdg-open and other tools never receive a bare relative name. */
+    /* Resolve extract_dir to an absolute path before the directory exists */
     char extract_dir[MAX_PATH];
     {
         char rel[MAX_PATH];
@@ -589,7 +872,7 @@ static int cmd_install(const char *bundle) {
     }
 
     /* Step 5: Open instructions */
-    if (open_instructions(extract_dir) != 0) {
+    if (open_instructions(extract_dir, app_name) != 0) {
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
         system(cmd);
         return 1;
@@ -623,6 +906,88 @@ static int cmd_install(const char *bundle) {
     printf("[capp] Add '%s' to PATH in your ~/.bashrc.\n", bin_dir);
 #endif
     return 0;
+}
+
+/* ── Subcommand: install-remote ────────────────────────────────────────────── */
+
+/*
+ * Download a package from mirror and install it.
+ * Automatically fetches the latest version.
+ * Usage: capp install-remote <AppName>
+ */
+static int cmd_install_remote(const char *pkg_name) {
+    Mirror *mirrors = get_mirrors();
+    char *packages_list = NULL;
+    PackageInfo *pkg_info = NULL;
+    char temp_capp[MAX_PATH];
+    char cmd[MAX_CMD];
+    int success = 0;
+
+    printf("=== CAPP — Install from Mirror ===\n");
+    printf("[capp] Package : %s\n", pkg_name);
+    printf("[capp] Version : (latest)\n\n");
+
+    /* Try each mirror */
+    for (int i = 0; mirrors[i].url[0] != '\0'; i++) {
+        const char *mirror = mirrors[i].url;
+        
+        /* Fetch packages.txt */
+        packages_list = fetch_packages_list(mirror);
+        if (!packages_list) continue;
+        
+        /* Find the package in the list (NULL version = latest) */
+        pkg_info = find_package_in_list(packages_list, pkg_name, NULL);
+        
+        if (pkg_info) {
+            /* Found it! Now download the .capp file */
+            printf("[capp] Found version: %s\n", pkg_info->version);
+            
+            const char *home = getenv(HOME_ENV);
+            if (!home) home = ".";
+            
+#ifdef _WIN32
+            snprintf(temp_capp, sizeof(temp_capp), "%s\\.capp\\%s", home, pkg_info->filename);
+#else
+            snprintf(temp_capp, sizeof(temp_capp), "%s/.capp/%s", home, pkg_info->filename);
+#endif
+            
+            if (download_capp_file(mirror, pkg_info->filename, temp_capp)) {
+                printf("[capp] Successfully downloaded from: %s\n\n", mirror);
+                success = 1;
+                break;
+            }
+        }
+        
+        free(packages_list);
+        if (pkg_info) {
+            free(pkg_info->version);
+            free(pkg_info->filename);
+            free(pkg_info);
+        }
+        packages_list = NULL;
+        pkg_info = NULL;
+    }
+
+    if (!success) {
+        fprintf(stderr, "[capp] Package '%s' not found on any mirror.\n", pkg_name);
+        return 1;
+    }
+
+    /* Now install the downloaded .capp file */
+    int ret = cmd_install(temp_capp);
+    
+    /* Clean up temp file */
+    snprintf(cmd, sizeof(cmd), REMOVE_FILE_CMD, temp_capp);
+    system(cmd);
+    
+    free(packages_list);
+    if (pkg_info) {
+        free(pkg_info->version);
+        free(pkg_info->filename);
+        free(pkg_info);
+    }
+    
+    return ret;
 }
 
 /* ── Subcommand: uninstall ─────────────────────────────────────────────────── */
@@ -725,13 +1090,39 @@ static int cmd_uninstall(const char *arg) {
     return 0;
 }
 
+/* ── Subcommand: clear-cache ──────────────────────────────────────────────── */
+
+static int cmd_clear_cache(void) {
+    char cache_dir[MAX_PATH];
+    char cmd[MAX_CMD];
+
+    if (!get_cache_dir(cache_dir, sizeof(cache_dir))) return 1;
+
+    printf("=== CAPP — Clear Cache ===\n");
+    printf("[capp] Cache directory: %s\n\n", cache_dir);
+
+    snprintf(cmd, sizeof(cmd), RMDIR_CMD, cache_dir);
+    
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[capp] Warning: Could not remove cache directory.\n");
+        return 1;
+    }
+
+    printf("[capp] Cache cleared successfully.\n");
+    return 0;
+}
+
 /* ── Entry point ───────────────────────────────────────────────────────────── */
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s create                 — bundle a folder into a .capp file\n", prog);
-    fprintf(stderr, "  %s install  <App.capp>    — install a .capp bundle\n", prog);
-    fprintf(stderr, "  %s uninstall <AppName>    — uninstall a previously installed app\n", prog);
+    fprintf(stderr, "  %s create                     — bundle a folder into a .capp file\n", prog);
+    fprintf(stderr, "  %s install  <App.capp>        — install a .capp bundle\n", prog);
+    fprintf(stderr, "  %s install-remote <AppName>   — install latest version from mirror\n", prog);
+    fprintf(stderr, "  %s uninstall <AppName>        — uninstall a previously installed app\n", prog);
+    fprintf(stderr, "  %s clear-cache                — clear instructions cache\n", prog);
+    fprintf(stderr, "\nEnvironment variables:\n");
+    fprintf(stderr, "  CAPP_MIRROR=https://...  — override default mirror URL\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -758,12 +1149,28 @@ int main(int argc, char *argv[]) {
         return cmd_install(argv[2]);
     }
 
+    if (strcmp(subcmd, "install-remote") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "Usage: %s install-remote <AppName>\n", argv[0]);
+            return 1;
+        }
+        return cmd_install_remote(argv[2]);
+    }
+
     if (strcmp(subcmd, "uninstall") == 0) {
         if (argc != 3) {
             fprintf(stderr, "Usage: %s uninstall <AppName>\n", argv[0]);
             return 1;
         }
         return cmd_uninstall(argv[2]);
+    }
+
+    if (strcmp(subcmd, "clear-cache") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "Usage: %s clear-cache\n", argv[0]);
+            return 1;
+        }
+        return cmd_clear_cache();
     }
 
     fprintf(stderr, "Unknown subcommand: '%s'\n\n", subcmd);
