@@ -23,7 +23,6 @@
 #include <string.h>
 #include <ctype.h>
 
-
 /* ── Platform-specific definitions ────────────────────────────────────────── */
 
 #ifdef _WIN32
@@ -1243,6 +1242,11 @@ static int cmd_upgrade(const char *app_name_arg) {
     if (app_name_arg) {
         /* Upgrade single package */
         printf("=== CAPP — Upgrade '%s' ===\n", app_name_arg);
+        if (!is_app_installed(app_name_arg)) {
+            fprintf(stderr, "[capp] Error: '%s' is not installed.\n", app_name_arg);
+            free(available_data);
+            return 1;
+        }
         ret = upgrade_single(app_name_arg, available_data);
     } else {
         /* Upgrade all installed packages */
@@ -1372,7 +1376,7 @@ static int cmd_search(const char *query) {
         }
     }
 
-    /* ----- Search local metadata.json files ----- */
+    /* ----- Search local metadata.json files (installed packages only) ----- */
     char data_dir[MAX_PATH];
     if (!get_data_dir(data_dir, sizeof(data_dir))) return 0;
 
@@ -1386,28 +1390,30 @@ static int cmd_search(const char *query) {
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY &&
-                strcmp(fd.cFileName, ".") != 0 && strcmp(fd.cFileName, "..") != 0) {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
 
-                char meta_path[MAX_PATH];
-                snprintf(meta_path, sizeof(meta_path), "%s\\%s\\metadata.json",
-                         data_dir, fd.cFileName);
-                FILE *mf = fopen(meta_path, "r");
-                if (!mf) continue;
-                fseek(mf, 0, SEEK_END); long msz = ftell(mf); fseek(mf, 0, SEEK_SET);
-                char *mbuf = malloc(msz + 1);
-                fread(mbuf, 1, msz, mf); fclose(mf); mbuf[msz] = '\0';
+            /* Only consider packages that are in installed.txt */
+            if (!is_app_installed(fd.cFileName)) continue;
 
-                if (icontains(mbuf, query)) {
-                    char name[256] = "", ver[64] = "", desc[512] = "";
-                    json_get_string(mbuf, "name", name, sizeof(name));
-                    json_get_string(mbuf, "version", ver, sizeof(ver));
-                    json_get_string(mbuf, "description", desc, sizeof(desc));
-                    printf("  %-24s  %-12s  %s\n", name[0] ? name : fd.cFileName, ver, desc);
-                    local_found = 1;
-                }
-                free(mbuf);
+            char meta_path[MAX_PATH];
+            snprintf(meta_path, sizeof(meta_path), "%s\\%s\\metadata.json",
+                     data_dir, fd.cFileName);
+            FILE *mf = fopen(meta_path, "r");
+            if (!mf) continue;
+            fseek(mf, 0, SEEK_END); long msz = ftell(mf); fseek(mf, 0, SEEK_SET);
+            char *mbuf = malloc(msz + 1);
+            fread(mbuf, 1, msz, mf); fclose(mf); mbuf[msz] = '\0';
+
+            if (icontains(mbuf, query)) {
+                char name[256] = "", ver[64] = "", desc[512] = "";
+                json_get_string(mbuf, "name", name, sizeof(name));
+                json_get_string(mbuf, "version", ver, sizeof(ver));
+                json_get_string(mbuf, "description", desc, sizeof(desc));
+                printf("  %-24s  %-12s  %s\n", name[0] ? name : fd.cFileName, ver, desc);
+                local_found = 1;
             }
+            free(mbuf);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
@@ -1417,6 +1423,10 @@ static int cmd_search(const char *query) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
             if (entry->d_name[0] == '.') continue;
+
+            /* Only consider packages that are in installed.txt */
+            if (!is_app_installed(entry->d_name)) continue;
+
             char meta_path[MAX_PATH];
             snprintf(meta_path, sizeof(meta_path), "%s/%s/metadata.json",
                      data_dir, entry->d_name);
@@ -1447,7 +1457,7 @@ static int cmd_search(const char *query) {
     return 0;
 }
 
-/* ── Subcommand: show ──────────────────────────────────────────────────────── */
+/* ── Subcommand: show ────────────────────────────────────────────── */
 
 static int cmd_show(const char *app_name_raw) {
     char app_name[MAX_PATH];
@@ -1455,9 +1465,9 @@ static int cmd_show(const char *app_name_raw) {
     app_name[sizeof(app_name) - 1] = '\0';
     strip_capp_ext(app_name);
 
-    printf("=== CAPP — Show: %s ===\n\n", app_name);
+    printf("=== CAPP \u2014 Show: %s ===\n\n", app_name);
 
-    /* Read local metadata if installed */
+    /* Show metadata if the data directory exists for this package */
     char app_data_dir[MAX_PATH];
     get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir));
     char meta_path[MAX_PATH];
@@ -1480,12 +1490,14 @@ static int cmd_show(const char *app_name_raw) {
         printf("  Version     : %s\n", version[0]     ? version     : "unknown");
         printf("  Author      : %s\n", author[0]      ? author      : "unknown");
         printf("  Description : %s\n", description[0] ? description : "(none)");
-        printf("  Installed   : yes\n");
     } else {
-        printf("  (No local metadata found — package may not be installed)\n");
+        printf("  (No metadata available \u2014 data directory not present)\n");
     }
 
-    /* Also check available.txt for mirror info */
+    /* Installed status comes solely from installed.txt */
+    printf("  Installed   : %s\n", is_app_installed(app_name) ? "yes" : "no");
+
+    /* Check available.txt for the latest mirror version */
     char bundles_dir[MAX_PATH];
     get_bundles_dir(bundles_dir, sizeof(bundles_dir));
     char available_path[MAX_PATH];
@@ -1632,6 +1644,109 @@ static int cmd_man(const char *app_name_raw) {
         }
     }
 #endif
+
+    return 0;
+}
+
+/* -- Subcommand: list --------------------------------------------------------- */
+
+/*
+ * List all packages in available.txt (one per line, showing the latest
+ * version of each unique package name).
+ */
+static int cmd_list(void) {
+    char bundles_dir[MAX_PATH];
+    if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
+
+    char available_path[MAX_PATH];
+    snprintf(available_path, sizeof(available_path), "%s%savailable.txt",
+             bundles_dir, PATH_SEP);
+
+    printf("=== CAPP -- Available Packages ===\n\n");
+
+    FILE *af = fopen(available_path, "r");
+    if (!af) {
+        fprintf(stderr, "[capp] available.txt not found. Run 'capp update' first.\n");
+        return 1;
+    }
+
+    /* Collect latest version of each unique package name */
+    typedef struct { char name[256]; char version[64]; } Entry;
+    Entry entries[1024];
+    int nentries = 0;
+
+    char line[MAX_PATH];
+    while (fgets(line, sizeof(line), af)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strlen(line) == 0 || line[0] == '#') continue;
+
+        char name[256], version[64], filename[256];
+        if (sscanf(line, "%255[^|]|%63[^|]|%255s", name, version, filename) < 3) continue;
+
+        int found = 0;
+        for (int i = 0; i < nentries; i++) {
+            if (strcmp(entries[i].name, name) == 0) {
+                if (compare_versions(version, entries[i].version) > 0)
+                    strncpy(entries[i].version, version, 63);
+                found = 1;
+                break;
+            }
+        }
+        if (!found && nentries < 1024) {
+            strncpy(entries[nentries].name,    name,    255);
+            strncpy(entries[nentries].version, version, 63);
+            nentries++;
+        }
+    }
+    fclose(af);
+
+    if (nentries == 0) {
+        printf("  (no packages listed)\n");
+        return 0;
+    }
+
+    for (int i = 0; i < nentries; i++)
+        printf("  %-24s  %s\n", entries[i].name, entries[i].version);
+
+    printf("\n  %d package(s) available.\n", nentries);
+    return 0;
+}
+
+/* -- Subcommand: list-installed ----------------------------------------------- */
+
+/*
+ * List all packages recorded in installed.txt.
+ */
+static int cmd_list_installed(void) {
+    char bundles_dir[MAX_PATH];
+    if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
+
+    char installed_path[MAX_PATH];
+    snprintf(installed_path, sizeof(installed_path), "%s%sinstalled.txt",
+             bundles_dir, PATH_SEP);
+
+    printf("=== CAPP -- Installed Packages ===\n\n");
+
+    FILE *f = fopen(installed_path, "r");
+    if (!f) {
+        printf("  (no packages installed)\n");
+        return 0;
+    }
+
+    int count = 0;
+    char line[MAX_PATH];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strlen(line) == 0) continue;
+        printf("  %s\n", line);
+        count++;
+    }
+    fclose(f);
+
+    if (count == 0)
+        printf("  (no packages installed)\n");
+    else
+        printf("\n  %d package(s) installed.\n", count);
 
     return 0;
 }
@@ -1796,6 +1911,16 @@ int main(int argc, char *argv[]) {
     if (strcmp(subcmd, "man") == 0) {
         if (argc != 3) { fprintf(stderr, "Usage: %s man <AppName>\n", argv[0]); return 1; }
         return cmd_man(argv[2]);
+    }
+
+    if (strcmp(subcmd, "list") == 0) {
+        if (argc != 2) { fprintf(stderr, "Usage: %s list\n", argv[0]); return 1; }
+        return cmd_list();
+    }
+
+    if (strcmp(subcmd, "list-installed") == 0) {
+        if (argc != 2) { fprintf(stderr, "Usage: %s list-installed\n", argv[0]); return 1; }
+        return cmd_list_installed();
     }
 
     if (strcmp(subcmd, "clear-cache") == 0) {
