@@ -56,7 +56,7 @@ If no `metadata.json` is provided in the bundle, CAPP generates a minimal one wi
 | `uninstall` | `[-V\|--verbose] <AppName>` | Uninstall a previously installed app |
 | `update` | `[-V\|--verbose]` | Refresh `available.txt` from all mirrors, show upgradeable packages |
 | `upgrade` | `[-V\|--verbose] [AppName]` | Upgrade one package, or all installed packages if no argument given |
-| `list` | `[--verbose]` | List all packages available on the configured mirrors |
+| `list` | `[-V\--verbose]` | List all packages available on the configured mirrors |
 | `list-installed` | `[-V\|--verbose]` | List all installed packages |
 | `search` | `<query>` | Search available and installed packages by name or metadata |
 | `show` | `<AppName>` | Show metadata and install status for any package |

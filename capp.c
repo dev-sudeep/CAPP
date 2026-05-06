@@ -12,7 +12,7 @@
  *   capp uninstall <AppName>               — uninstall a previously installed app
  *   capp update                            — refresh available.txt + packages.json, show upgrades
  *   capp upgrade [AppName]                 — upgrade one or all installed packages
- *   capp list [--verbose]                  — list all available packages
+ *   capp list                              — list all available packages
  *   capp list-installed                    — list all installed packages
  *   capp search <query>                    — search available and installed packages
  *   capp show <AppName>                    — show full metadata for a package
@@ -2640,7 +2640,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  %s uninstall [-V] <AppName>                 — uninstall a previously installed app\n", prog);
     fprintf(stderr, "  %s update [-V]                              — refresh package indexes from mirrors\n", prog);
     fprintf(stderr, "  %s upgrade [-V] [AppName]                   — upgrade one or all packages\n", prog);
-    fprintf(stderr, "  %s list [--verbose]                         — list all available packages\n", prog);
+    fprintf(stderr, "  %s list [-V]                         — list all available packages\n", prog);
     fprintf(stderr, "  %s list-installed [-V]                      — list all installed packages\n", prog);
     fprintf(stderr, "  %s search <query>                           — search available and installed packages\n", prog);
     fprintf(stderr, "  %s show <AppName>                           — show package metadata\n", prog);
@@ -2751,8 +2751,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "list") == 0) {
-        if (argc > 3) { fprintf(stderr, "Usage: %s list [--verbose]\n", argv[0]); return 1; }
-        int verbose = (argc == 3 && strcmp(argv[2], "--verbose") == 0);
+        if (argc > 3) { fprintf(stderr, "Usage: %s list [--verbose|-V]\n", argv[0]); return 1; }
+        int verbose = is_verbose_flag(argv[2]) || is_verbose_flag(argv[3]);
         return cmd_list(verbose);
     }
 
