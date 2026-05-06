@@ -10,10 +10,12 @@
  *   capp install   <App.capp>              — install a bundle from local file
  *   capp install-remote <AppName>          — install latest from mirror
  *   capp uninstall <AppName>               — uninstall a previously installed app
- *   capp update                            — refresh available.txt from all mirrors, show upgrades
+ *   capp update                            — refresh available.txt + packages.json, show upgrades
  *   capp upgrade [AppName]                 — upgrade one or all installed packages
- *   capp search <query>                    — search available packages
- *   capp show <AppName>                    — show metadata for a package
+ *   capp list [--verbose]                  — list all available packages
+ *   capp list-installed                    — list all installed packages
+ *   capp search <query>                    — search available and installed packages
+ *   capp show <AppName>                    — show full metadata for a package
  *   capp man <AppName>                     — open instructions for an installed app
  *   capp clear-cache                       — remove cached instructions files (keeps metadata)
  */
@@ -490,7 +492,7 @@ static int get_installed_version(const char *app_name, char *ver_out, size_t ver
  * Saves it (and metadata) into ~/.capp/data/<app_name>/.
  */
 static int open_instructions(const char *extract_dir, const char *app_name,
-                              const char *version) {
+                              const char *version, int save_meta) {
     char found_path[MAX_PATH];
     char app_data_dir[MAX_PATH];
     char cached_path[MAX_PATH];
@@ -504,7 +506,7 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) {
         printf("[capp] No instructions file found in bundle.\n");
-        save_metadata(app_name, version, extract_dir);
+        if (save_meta) save_metadata(app_name, version, extract_dir);
         return 0;
     }
     snprintf(found_path, sizeof(found_path), "%s\\%s", extract_dir, fd.cFileName);
@@ -513,7 +515,7 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     DIR *dir = opendir(extract_dir);
     if (!dir) {
         fprintf(stderr, "[capp] Warning: Could not scan bundle directory.\n");
-        save_metadata(app_name, version, extract_dir);
+        if (save_meta) save_metadata(app_name, version, extract_dir);
         return 0;
     }
     struct dirent *entry;
@@ -527,7 +529,7 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     closedir(dir);
     if (found_path[0] == '\0') {
         printf("[capp] No instructions file found in bundle.\n");
-        save_metadata(app_name, version, extract_dir);
+        if (save_meta) save_metadata(app_name, version, extract_dir);
         return 0;
     }
 #endif
@@ -547,8 +549,8 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     snprintf(cmd, sizeof(cmd), MKDIR_CMD, app_data_dir);
     system(cmd);
 
-    /* Save metadata first */
-    save_metadata(app_name, version, extract_dir);
+    /* Save metadata (only during installation, not when fetching for man) */
+    if (save_meta) save_metadata(app_name, version, extract_dir);
 
     /* Copy instructions */
     snprintf(cached_path, sizeof(cached_path), "%s%s%s",
@@ -591,6 +593,479 @@ typedef struct {
     char *version;
     char *filename;
 } PackageInfo;
+
+/* ── Persistent package metadata (packages.json) ──────────────────────────── */
+
+/*
+ * Dynamic key-value store for arbitrary metadata fields.
+ * Allows mirrors to include any fields without requiring code changes.
+ */
+#define PM_MAX_FIELDS 64
+#define PM_KEY_LEN    64
+#define PM_VAL_LEN    512
+
+typedef struct {
+    char keys[PM_MAX_FIELDS][PM_KEY_LEN];
+    char values[PM_MAX_FIELDS][PM_VAL_LEN];
+    int  count;
+} PackageMetadata;
+
+static void pm_free(PackageMetadata *pm) {
+    /* Stack-allocated arrays; nothing to free, but zero for safety */
+    if (pm) { pm->count = 0; }
+}
+
+/*
+ * Get the path to ~/.capp/bundles/packages.json.
+ */
+static int get_packages_json_path(char *out, size_t out_sz) {
+    char bundles_dir[MAX_PATH];
+    if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 0;
+    snprintf(out, out_sz, "%s%spackages.json", bundles_dir, PATH_SEP);
+    return 1;
+}
+
+/*
+ * Capitalise the first letter of a copy of key for pretty display.
+ * e.g. "homepage" -> "Homepage", "minVersion" -> "MinVersion"
+ */
+static void capitalise_key(const char *key, char *out, size_t out_sz) {
+    size_t i;
+    for (i = 0; i < out_sz - 1 && key[i]; i++)
+        out[i] = (i == 0) ? (char)toupper((unsigned char)key[i]) : key[i];
+    out[i] = '\0';
+}
+
+/*
+ * Minimal JSON string-value extractor (reuses existing json_get_string).
+ * Parse a JSON array ["a","b","c"] into a comma-separated string.
+ */
+static void json_get_array_as_csv(const char *json, const char *key,
+                                   char *out, size_t out_sz) {
+    char search[PM_KEY_LEN + 4];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(json, search);
+    if (!p) { out[0] = '\0'; return; }
+    p += strlen(search);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '[') { out[0] = '\0'; return; }
+    p++;
+    out[0] = '\0';
+    size_t written = 0;
+    int first = 1;
+    while (*p && *p != ']') {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') p++;
+        if (*p == '"') {
+            p++;
+            if (!first && written < out_sz - 2) {
+                out[written++] = ',';
+                out[written++] = ' ';
+            }
+            while (*p && *p != '"' && written < out_sz - 1) {
+                if (*p == '\\') { p++; if (!*p) break; }
+                out[written++] = *p++;
+            }
+            out[written] = '\0';
+            first = 0;
+            if (*p == '"') p++;
+        } else {
+            p++;
+        }
+    }
+}
+
+/*
+ * Parse ALL key-value fields from a single JSON object string (the text
+ * between { and }) into a PackageMetadata.  Handles string values and
+ * array values (collapsed to CSV).  Skips nested objects.
+ * The input json should be the full object text including braces.
+ */
+static PackageMetadata parse_package_metadata_obj(const char *json) {
+    PackageMetadata pm;
+    pm.count = 0;
+
+    const char *p = json;
+    /* Find opening brace */
+    while (*p && *p != '{') p++;
+    if (!*p) return pm;
+    p++;
+
+    while (*p && *p != '}' && pm.count < PM_MAX_FIELDS) {
+        /* Skip whitespace and commas */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p != '"') { p++; continue; }
+        p++; /* skip opening quote of key */
+
+        /* Read key */
+        char key[PM_KEY_LEN] = {0};
+        size_t ki = 0;
+        while (*p && *p != '"' && ki < PM_KEY_LEN - 1) key[ki++] = *p++;
+        if (*p == '"') p++;
+
+        /* Skip : and whitespace */
+        while (*p == ' ' || *p == '\t' || *p == ':') p++;
+
+        char val[PM_VAL_LEN] = {0};
+        if (*p == '"') {
+            /* String value */
+            p++;
+            size_t vi = 0;
+            while (*p && *p != '"' && vi < PM_VAL_LEN - 1) {
+                if (*p == '\\') { p++; if (!*p) break; }
+                val[vi++] = *p++;
+            }
+            if (*p == '"') p++;
+        } else if (*p == '[') {
+            /* Array: collapse to CSV */
+            const char *arr_start = p;
+            /* Find closing bracket (simple, no nesting) */
+            const char *arr_end = arr_start + 1;
+            while (*arr_end && *arr_end != ']') arr_end++;
+            /* Build a temp null-terminated copy for the extractor */
+            size_t arr_len = (size_t)(arr_end - arr_start) + 2;
+            if (arr_len < 4096) {
+                char arr_tmp[4096];
+                /* Wrap in a fake JSON object so json_get_array_as_csv can find it */
+                snprintf(arr_tmp, sizeof(arr_tmp), "{\"__arr\":%.*s]}", (int)(arr_end - arr_start + 1), arr_start);
+                json_get_array_as_csv(arr_tmp, "__arr", val, PM_VAL_LEN);
+            }
+            p = arr_end + 1;
+        } else if (*p == '{') {
+            /* Nested object: skip it */
+            int depth = 1;
+            p++;
+            while (*p && depth > 0) {
+                if (*p == '{') depth++;
+                else if (*p == '}') depth--;
+                p++;
+            }
+            continue; /* don't store nested objects */
+        } else {
+            /* Number or boolean: read until delimiter */
+            size_t vi = 0;
+            while (*p && *p != ',' && *p != '}' && *p != ' ' && *p != '\n' && vi < PM_VAL_LEN - 1)
+                val[vi++] = *p++;
+        }
+
+        if (key[0] != '\0') {
+            strncpy(pm.keys[pm.count],   key, PM_KEY_LEN - 1);
+            strncpy(pm.values[pm.count], val, PM_VAL_LEN - 1);
+            pm.count++;
+        }
+    }
+    return pm;
+}
+
+/*
+ * Find the JSON object for name+version inside a packages.json content string.
+ * Caller owns nothing — returns a pointer into the existing buffer, or NULL.
+ * The object text is copied into out_buf (caller supplies, size out_sz).
+ * Returns 1 on success.
+ */
+static int find_pkg_json_obj(const char *packages_json,
+                              const char *pkg_name, const char *pkg_version,
+                              char *out_buf, size_t out_sz) {
+    if (!packages_json || !pkg_name) return 0;
+
+    /* Find the "packages" array and scan only its direct children. */
+    const char *p = strstr(packages_json, "\"packages\"");
+    if (!p) return 0;
+    while (*p && *p != '[') p++;
+    if (!*p) return 0;
+    p++; /* skip '[' */
+
+    /* Track the best (highest version) match when pkg_version is NULL */
+    char best_ver[64] = "";
+    int  best_pos = -1;          /* index into out_buf of current best — unused; we copy below */
+    char best_buf[32768];
+    best_buf[0] = '\0';
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == ']' || *p == '\0') break;
+        if (*p != '{') { p++; continue; }
+
+        const char *obj_start = p;
+        int depth = 1;
+        const char *q = p + 1;
+        while (*q && depth > 0) {
+            if (*q == '{') depth++;
+            else if (*q == '}') depth--;
+            q++;
+        }
+        if (depth != 0) break;
+
+        size_t obj_len = (size_t)(q - obj_start);
+        if (obj_len < out_sz) {
+            /* Temporarily null-terminate a local copy for json_get_string */
+            char tmp[32768];
+            if (obj_len < sizeof(tmp)) {
+                strncpy(tmp, obj_start, obj_len);
+                tmp[obj_len] = '\0';
+
+                char name_val[256] = "";
+                json_get_string(tmp, "name", name_val, sizeof(name_val));
+
+                if (strcmp(name_val, pkg_name) == 0) {
+                    char ver_val[64] = "";
+                    json_get_string(tmp, "version", ver_val, sizeof(ver_val));
+
+                    if (pkg_version) {
+                        /* Exact version requested */
+                        if (strcmp(ver_val, pkg_version) == 0) {
+                            strncpy(out_buf, tmp, out_sz - 1);
+                            out_buf[out_sz - 1] = '\0';
+                            return 1;
+                        }
+                    } else {
+                        /* No version requested: keep highest */
+                        if (!best_buf[0] || compare_versions(ver_val, best_ver) > 0) {
+                            strncpy(best_ver, ver_val, sizeof(best_ver) - 1);
+                            strncpy(best_buf, tmp, sizeof(best_buf) - 1);
+                            best_pos = 1;
+                        }
+                    }
+                }
+            }
+        }
+        p = q;
+    }
+
+    if (!pkg_version && best_buf[0]) {
+        strncpy(out_buf, best_buf, out_sz - 1);
+        out_buf[out_sz - 1] = '\0';
+        return 1;
+    }
+    (void)best_pos;
+    return 0;
+}
+
+/*
+ * Load packages.json from disk. Returns allocated string or NULL.
+ * Caller must free.
+ */
+static char* load_packages_json(void) {
+    char path[MAX_PATH];
+    if (!get_packages_json_path(path, sizeof(path))) return NULL;
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return NULL; }
+    char *buf = malloc(sz + 1);
+    fread(buf, 1, sz, f);
+    fclose(f);
+    buf[sz] = '\0';
+    return buf;
+}
+
+/*
+ * Fetch packages.json from a mirror URL.
+ * packages.json is mandatory — returns NULL on failure and prints an error.
+ */
+static char* fetch_packages_json(const char *mirror_url) {
+    char curl_url[MAX_PATH];
+    char temp_file[MAX_PATH];
+    char cmd[MAX_CMD];
+
+    const char *home = getenv(HOME_ENV);
+    if (!home) home = ".";
+#ifdef _WIN32
+    snprintf(temp_file, sizeof(temp_file), "%s\\.capp\\pkgmeta.tmp", home);
+#else
+    snprintf(temp_file, sizeof(temp_file), "%s/.capp/pkgmeta.tmp", home);
+#endif
+
+    snprintf(curl_url, sizeof(curl_url), "%s/packages.json", mirror_url);
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "curl -s -f -o \"%s\" \"%s\"", temp_file, curl_url);
+#else
+    snprintf(cmd, sizeof(cmd), "curl -s -f -o '%s' '%s'", temp_file, curl_url);
+#endif
+
+    printf("[capp] Fetching package metadata from: %s\n", mirror_url);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[capp] Error: packages.json is required but not found on mirror: %s\n"
+               "       Mirrors must provide both packages.txt and packages.json.\n", mirror_url);
+        return NULL;
+    }
+
+    FILE *f = fopen(temp_file, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return NULL; }
+    char *content = malloc(sz + 1);
+    fread(content, 1, sz, f);
+    fclose(f);
+    content[sz] = '\0';
+
+    /* Sanity check: ensure the file looks like a packages.json */
+    if (!strstr(content, "packages")) {
+        fprintf(stderr, "[capp] Error: packages.json from mirror is malformed or empty.\n");
+        free(content);
+        return NULL;
+    }
+
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "del /f /q \"%s\"", temp_file);
+#else
+    snprintf(cmd, sizeof(cmd), "rm -f '%s'", temp_file);
+#endif
+    system(cmd);
+    return content;
+}
+
+/*
+ * Merge two packages.json content strings by name|version deduplication.
+ * For duplicate name+version, the entry already in base wins.
+ * Returns a newly allocated merged JSON string.  Caller must free.
+ */
+/*
+ * Scan the direct-child objects inside a packages.json "packages" array,
+ * calling cb(obj_text, obj_len, userdata) for each one.
+ * This correctly skips the outer {"packages":[...]} wrapper and only
+ * visits the immediate child objects of the array.
+ */
+typedef void (*obj_cb)(const char *obj, size_t len, void *ud);
+
+static void scan_package_array(const char *json, obj_cb cb, void *ud) {
+    if (!json) return;
+    /* Find the "packages" key then the opening '[' */
+    const char *p = strstr(json, "\"packages\"");
+    if (!p) return;
+    p += 10; /* skip "packages" */
+    while (*p && *p != '[') p++;
+    if (!*p) return;
+    p++; /* skip '[' */
+
+    /* Now iterate direct-child objects at depth 0 relative to this array */
+    while (*p) {
+        /* Skip whitespace and commas */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == ']' || *p == '\0') break;
+        if (*p != '{') { p++; continue; }
+
+        /* Find the matching closing brace */
+        const char *obj_start = p;
+        int depth = 1;
+        const char *q = p + 1;
+        while (*q && depth > 0) {
+            if (*q == '{') depth++;
+            else if (*q == '}') depth--;
+            q++;
+        }
+        if (depth != 0) break;
+        cb(obj_start, (size_t)(q - obj_start), ud);
+        p = q;
+    }
+}
+
+static char* merge_packages_json(const char *base, const char *incoming) {
+    char **objs = NULL;
+    int  nobj = 0, obj_alloc = 0;
+
+    #define ADD_OBJ(s, len) do { \
+        if (nobj >= obj_alloc) { \
+            obj_alloc = obj_alloc ? obj_alloc * 2 : 64; \
+            objs = realloc(objs, obj_alloc * sizeof(char *)); \
+        } \
+        objs[nobj] = malloc((len) + 1); \
+        memcpy(objs[nobj], (s), (len)); \
+        objs[nobj][(len)] = '\0'; \
+        nobj++; \
+    } while (0)
+
+    char tmp[32768];
+
+    /* Callback: add object from base unconditionally (it was already deduped) */
+    struct { char **objs; int *nobj; int *alloc; } base_ud = { objs, &nobj, &obj_alloc };
+    (void)base_ud; /* used via macro below */
+
+    /* Collect all direct children from base */
+    if (base) {
+        const char *p_base = strstr(base, "\"packages\"");
+        if (p_base) {
+            while (*p_base && *p_base != '[') p_base++;
+            if (*p_base) {
+                p_base++;
+                while (*p_base) {
+                    while (*p_base == ' ' || *p_base == '\t' || *p_base == '\n' ||
+                           *p_base == '\r' || *p_base == ',') p_base++;
+                    if (*p_base == ']' || *p_base == '\0') break;
+                    if (*p_base != '{') { p_base++; continue; }
+                    const char *os = p_base;
+                    int depth = 1; const char *q = p_base + 1;
+                    while (*q && depth > 0) {
+                        if (*q == '{') depth++; else if (*q == '}') depth--; q++;
+                    }
+                    if (depth != 0) break;
+                    size_t olen = (size_t)(q - os);
+                    if (olen < sizeof(tmp)) ADD_OBJ(os, olen);
+                    p_base = q;
+                }
+            }
+        }
+    }
+
+    /* Collect from incoming, skipping name+version duplicates */
+    if (incoming) {
+        const char *p_in = strstr(incoming, "\"packages\"");
+        if (p_in) {
+            while (*p_in && *p_in != '[') p_in++;
+            if (*p_in) {
+                p_in++;
+                while (*p_in) {
+                    while (*p_in == ' ' || *p_in == '\t' || *p_in == '\n' ||
+                           *p_in == '\r' || *p_in == ',') p_in++;
+                    if (*p_in == ']' || *p_in == '\0') break;
+                    if (*p_in != '{') { p_in++; continue; }
+                    const char *os = p_in;
+                    int depth = 1; const char *q = p_in + 1;
+                    while (*q && depth > 0) {
+                        if (*q == '{') depth++; else if (*q == '}') depth--; q++;
+                    }
+                    if (depth != 0) break;
+                    size_t olen = (size_t)(q - os);
+                    if (olen < sizeof(tmp)) {
+                        strncpy(tmp, os, olen); tmp[olen] = '\0';
+                        char n[256]="", v[64]="";
+                        json_get_string(tmp, "name",    n, sizeof(n));
+                        json_get_string(tmp, "version", v, sizeof(v));
+                        if (!n[0]) { p_in = q; continue; }
+                        int dup = 0;
+                        for (int i = 0; i < nobj; i++) {
+                            char en[256]="", ev[64]="";
+                            json_get_string(objs[i], "name",    en, sizeof(en));
+                            json_get_string(objs[i], "version", ev, sizeof(ev));
+                            if (strcmp(en,n)==0 && strcmp(ev,v)==0) { dup=1; break; }
+                        }
+                        if (!dup) ADD_OBJ(os, olen);
+                    }
+                    p_in = q;
+                }
+            }
+        }
+    }
+    #undef ADD_OBJ
+
+    /* Build output */
+    size_t total = 32;
+    for (int i = 0; i < nobj; i++) total += strlen(objs[i]) + 3;
+    char *out = malloc(total + 4);
+    size_t pos = 0;
+    pos += sprintf(out + pos, "{\"packages\": [");
+    for (int i = 0; i < nobj; i++) {
+        if (i > 0) out[pos++] = ',';
+        out[pos++] = '\n';
+        size_t sl = strlen(objs[i]);
+        memcpy(out + pos, objs[i], sl); pos += sl;
+        free(objs[i]);
+    }
+    pos += sprintf(out + pos, "\n]}");
+    out[pos] = '\0';
+    free(objs);
+    return out;
+}
+
 
 static PackageInfo* find_package_in_list(const char *packages_txt,
                                           const char *pkg_name,
@@ -727,6 +1202,25 @@ static int download_capp_file(const char *mirror_url,
     return system(cmd) == 0;
 }
 
+/* ── Verbose / flag helpers ───────────────────────────────────────────────── */
+
+/*
+ * Returns 1 if s is a recognised verbose flag (-V or --verbose).
+ */
+static int is_verbose_flag(const char *s) {
+    return s && (strcmp(s, "-V") == 0 || strcmp(s, "--verbose") == 0);
+}
+
+/*
+ * Returns 1 if s is the version flag (-v).
+ */
+static int is_version_flag(const char *s) {
+    return s && strcmp(s, "-v") == 0;
+}
+
+/* Suppress a progress line when not in verbose mode */
+#define VLOG(verbose, ...) do { if (verbose) printf(__VA_ARGS__); } while (0)
+
 /* ── Subcommand: create ────────────────────────────────────────────────────── */
 
 static int cmd_create(void) {
@@ -776,7 +1270,7 @@ static int cmd_create(void) {
 
 /* ── Subcommand: install ───────────────────────────────────────────────────── */
 
-static int cmd_install_with_version(const char *bundle, const char *version) {
+static int cmd_install_with_version(const char *bundle, const char *version, int verbose) {
     if (!has_capp_ext(bundle)) {
         fprintf(stderr, "Error: '%s' does not have a .capp extension.\n", bundle);
         return 1;
@@ -809,8 +1303,8 @@ static int cmd_install_with_version(const char *bundle, const char *version) {
     char cmd[MAX_CMD];
 
     printf("=== CAPP — Install ===\n");
-    printf("[capp] Bundle   : %s\n", bundle);
-    printf("[capp] App name : %s\n\n", app_name);
+    VLOG(verbose, "[capp] Bundle   : %s\n", bundle);
+    VLOG(verbose, "[capp] App name : %s\n\n", app_name);
 
     snprintf(cmd, sizeof(cmd), MKDIR_CMD, bundles_dir);
     if (system(cmd) != 0) { fprintf(stderr, "Error: Could not create bundles directory.\n"); return 1; }
@@ -818,7 +1312,7 @@ static int cmd_install_with_version(const char *bundle, const char *version) {
     if (system(cmd) != 0) { fprintf(stderr, "Error: Could not create bin directory.\n"); return 1; }
 
     snprintf(cmd, sizeof(cmd), UNZIP_CMD, bundle, extract_dir);
-    printf("[capp] Extracting bundle...\n");
+    VLOG(verbose, "[capp] Extracting bundle...\n");
     if (system(cmd) != 0) { fprintf(stderr, "Error: Extraction failed. Is 'unzip' installed?\n"); return 1; }
 
     if (!review_script(extract_dir, INSTALL_SCRIPT)) {
@@ -829,7 +1323,7 @@ static int cmd_install_with_version(const char *bundle, const char *version) {
     }
 
     snprintf(cmd, sizeof(cmd), RUN_INSTALL, extract_dir);
-    printf("[capp] Running install script...\n");
+    VLOG(verbose, "[capp] Running install script...\n");
     int ret = system(cmd);
     if (ret != 0) {
         fprintf(stderr, "[capp] Install script exited with code %d.\n", ret);
@@ -838,7 +1332,7 @@ static int cmd_install_with_version(const char *bundle, const char *version) {
         return 1;
     }
 
-    if (open_instructions(extract_dir, app_name, version) != 0) {
+    if (open_instructions(extract_dir, app_name, version, 1) != 0) {
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
         system(cmd);
         return 1;
@@ -847,7 +1341,7 @@ static int cmd_install_with_version(const char *bundle, const char *version) {
     char dest_path[MAX_PATH];
     snprintf(dest_path, sizeof(dest_path), "%s%s%s.capp", bundles_dir, PATH_SEP, app_name);
     snprintf(cmd, sizeof(cmd), MOVE_CMD, bundle, dest_path);
-    printf("[capp] Storing bundle in: %s\n", dest_path);
+    VLOG(verbose, "[capp] Storing bundle in: %s\n", dest_path);
     if (system(cmd) != 0) {
         fprintf(stderr, "Warning: Could not move bundle to '%s'.\n", dest_path);
         fprintf(stderr, "         You may need to move '%s' manually.\n", bundle);
@@ -855,27 +1349,27 @@ static int cmd_install_with_version(const char *bundle, const char *version) {
 
     add_to_installed(app_name);
 
-    printf("[capp] Cleaning up...\n");
+    VLOG(verbose, "[capp] Cleaning up...\n");
     snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
     system(cmd);
 
     printf("[capp] Installation complete!\n");
-    printf("[capp] To uninstall, run: capp uninstall %s\n", app_name);
+    VLOG(verbose, "[capp] To uninstall, run: capp uninstall %s\n", app_name);
 #ifdef _WIN32
-    printf("[capp] Add '%s' to PATH in your PowerShell profile ($PROFILE).\n", bin_dir);
+    VLOG(verbose, "[capp] Add '%s' to PATH in your PowerShell profile ($PROFILE).\n", bin_dir);
 #else
-    printf("[capp] Add '%s' to PATH in your ~/.bashrc.\n", bin_dir);
+    VLOG(verbose, "[capp] Add '%s' to PATH in your ~/.bashrc.\n", bin_dir);
 #endif
     return 0;
 }
 
-static int cmd_install(const char *bundle) {
-    return cmd_install_with_version(bundle, NULL);
+static int cmd_install(const char *bundle, int verbose) {
+    return cmd_install_with_version(bundle, NULL, verbose);
 }
 
 /* ── Subcommand: install-remote ────────────────────────────────────────────── */
 
-static int cmd_install_remote(const char *pkg_name) {
+static int cmd_install_remote(const char *pkg_name, const char *pkg_version, int verbose) {
     Mirror *mirrors = get_mirrors();
     char *packages_list = NULL;
     PackageInfo *pkg_info = NULL;
@@ -885,7 +1379,7 @@ static int cmd_install_remote(const char *pkg_name) {
 
     printf("=== CAPP — Install from Mirror ===\n");
     printf("[capp] Package : %s\n", pkg_name);
-    printf("[capp] Version : (latest)\n\n");
+    printf("[capp] Version : %s\n\n", pkg_version ? pkg_version : "(latest)");
 
     for (int i = 0; mirrors[i].url[0] != '\0'; i++) {
         const char *mirror = mirrors[i].url;
@@ -893,7 +1387,7 @@ static int cmd_install_remote(const char *pkg_name) {
         packages_list = fetch_packages_list(mirror);
         if (!packages_list) continue;
 
-        pkg_info = find_package_in_list(packages_list, pkg_name, NULL);
+        pkg_info = find_package_in_list(packages_list, pkg_name, pkg_version);
 
         if (pkg_info) {
             printf("[capp] Found version: %s\n", pkg_info->version);
@@ -906,7 +1400,7 @@ static int cmd_install_remote(const char *pkg_name) {
             snprintf(temp_capp, sizeof(temp_capp), "%s/.capp/%s", home, pkg_info->filename);
 #endif
             if (download_capp_file(mirror, pkg_info->filename, temp_capp)) {
-                printf("[capp] Successfully downloaded from: %s\n\n", mirror);
+                VLOG(verbose, "[capp] Successfully downloaded from: %s\n\n", mirror);
                 success = 1;
                 break;
             }
@@ -927,7 +1421,7 @@ static int cmd_install_remote(const char *pkg_name) {
     strncpy(version_copy, pkg_info->version, sizeof(version_copy) - 1);
     version_copy[sizeof(version_copy) - 1] = '\0';
 
-    int ret = cmd_install_with_version(temp_capp, version_copy);
+    int ret = cmd_install_with_version(temp_capp, version_copy, verbose);
 
     snprintf(cmd, sizeof(cmd), REMOVE_FILE_CMD, temp_capp);
     system(cmd);
@@ -940,7 +1434,7 @@ static int cmd_install_remote(const char *pkg_name) {
 
 /* ── Subcommand: uninstall ─────────────────────────────────────────────────── */
 
-static int cmd_uninstall(const char *arg) {
+static int cmd_uninstall(const char *arg, int verbose) {
     char app_name[MAX_PATH];
     strncpy(app_name, arg, sizeof(app_name) - 1);
     app_name[sizeof(app_name) - 1] = '\0';
@@ -959,8 +1453,8 @@ static int cmd_uninstall(const char *arg) {
     char cmd[MAX_CMD];
 
     printf("=== CAPP — Uninstall ===\n");
-    printf("[capp] App    : %s\n", app_name);
-    printf("[capp] Bundle : %s\n\n", bundle_path);
+    VLOG(verbose, "[capp] App    : %s\n", app_name);
+    VLOG(verbose, "[capp] Bundle : %s\n\n", bundle_path);
 
     if (!is_app_installed(app_name)) {
         fprintf(stderr, "Error: '%s' is not installed.\n", app_name);
@@ -984,7 +1478,7 @@ static int cmd_uninstall(const char *arg) {
     }
 
     snprintf(cmd, sizeof(cmd), UNZIP_CMD, bundle_path, extract_dir);
-    printf("\n[capp] Extracting bundle...\n");
+    VLOG(verbose, "\n[capp] Extracting bundle...\n");
     if (system(cmd) != 0) { fprintf(stderr, "Error: Extraction failed.\n"); return 1; }
 
     if (!review_script(extract_dir, UNINSTALL_SCRIPT)) {
@@ -995,7 +1489,7 @@ static int cmd_uninstall(const char *arg) {
     }
 
     snprintf(cmd, sizeof(cmd), RUN_UNINSTALL, extract_dir);
-    printf("[capp] Running uninstall script...\n");
+    VLOG(verbose, "[capp] Running uninstall script...\n");
     int ret = system(cmd);
     if (ret != 0) {
         fprintf(stderr, "[capp] Uninstall script exited with code %d.\n", ret);
@@ -1004,16 +1498,30 @@ static int cmd_uninstall(const char *arg) {
         return 1;
     }
 
-    printf("[capp] Cleaning up...\n");
+    VLOG(verbose, "[capp] Cleaning up...\n");
     snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
     system(cmd);
 
     snprintf(cmd, sizeof(cmd), REMOVE_FILE_CMD, bundle_path);
-    printf("[capp] Removing stored bundle...\n");
+    VLOG(verbose, "[capp] Removing stored bundle...\n");
     if (system(cmd) != 0)
         fprintf(stderr, "Warning: Could not remove bundle.\n");
 
     remove_from_installed(app_name);
+
+    /* Remove app data directory (~/.capp/data/<AppName>/) */
+    {
+        char app_data_dir[MAX_PATH];
+        if (get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir))) {
+            char rm_cmd[MAX_CMD];
+            snprintf(rm_cmd, sizeof(rm_cmd), RMDIR_CMD, app_data_dir);
+            VLOG(verbose, "[capp] Removing data directory...\n");
+            if (system(rm_cmd) != 0)
+                fprintf(stderr, "[capp] Warning: Could not remove data directory '%s'.\n",
+                        app_data_dir);
+        }
+    }
+
     printf("[capp] '%s' has been uninstalled.\n", app_name);
     return 0;
 }
@@ -1025,7 +1533,7 @@ static int cmd_uninstall(const char *arg) {
  * name+version), writes ~/.capp/bundles/available.txt, then reports which
  * installed packages have a newer version available.
  */
-static int cmd_update(void) {
+static int cmd_update(int verbose) {
     Mirror *mirrors = get_mirrors();
     char bundles_dir[MAX_PATH];
     if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
@@ -1034,52 +1542,71 @@ static int cmd_update(void) {
     snprintf(available_path, sizeof(available_path), "%s%savailable.txt",
              bundles_dir, PATH_SEP);
 
+    char packages_json_path[MAX_PATH];
+    get_packages_json_path(packages_json_path, sizeof(packages_json_path));
+
     char cmd[MAX_CMD];
     snprintf(cmd, sizeof(cmd), MKDIR_CMD, bundles_dir);
     system(cmd);
 
-    printf("=== CAPP — Update ===\n");
+    printf("=== CAPP — Update ===\n\n");
 
-    /* Accumulate all lines across mirrors */
+    /* Accumulate packages.txt lines across mirrors */
     size_t total_alloc = 4096;
-    char *merged = malloc(total_alloc);
-    merged[0] = '\0';
+    char *merged_txt = malloc(total_alloc);
+    merged_txt[0] = '\0';
     size_t merged_len = 0;
 
+    /* Accumulate packages.json across mirrors */
+    char *merged_json = NULL;
+
     for (int i = 0; mirrors[i].url[0] != '\0'; i++) {
-        char *list = fetch_packages_list(mirrors[i].url);
-        if (!list) continue;
+        const char *mirror = mirrors[i].url;
 
-        /* Append each line if not already present (name|version duplicate check) */
-        char *list_copy = malloc(strlen(list) + 1);
-        strcpy(list_copy, list);
-        char *line = strtok(list_copy, "\n");
-
-        while (line) {
-            /* Skip empty / comment lines */
-            if (strlen(line) == 0 || line[0] == '#') { line = strtok(NULL, "\n"); continue; }
-
-            /* Check duplicate: look for exact line already in merged */
-            if (!strstr(merged, line)) {
-                size_t needed = merged_len + strlen(line) + 2;
-                if (needed > total_alloc) {
-                    total_alloc = needed * 2;
-                    merged = realloc(merged, total_alloc);
+        /* --- packages.txt --- */
+        char *list = fetch_packages_list(mirror);
+        if (list) {
+            char *list_copy = malloc(strlen(list) + 1);
+            strcpy(list_copy, list);
+            char *line = strtok(list_copy, "\n");
+            while (line) {
+                if (strlen(line) == 0 || line[0] == '#') { line = strtok(NULL, "\n"); continue; }
+                if (!strstr(merged_txt, line)) {
+                    size_t needed = merged_len + strlen(line) + 2;
+                    if (needed > total_alloc) {
+                        total_alloc = needed * 2;
+                        merged_txt = realloc(merged_txt, total_alloc);
+                    }
+                    strcpy(merged_txt + merged_len, line);
+                    merged_len += strlen(line);
+                    merged_txt[merged_len++] = '\n';
+                    merged_txt[merged_len]   = '\0';
                 }
-                strcpy(merged + merged_len, line);
-                merged_len += strlen(line);
-                merged[merged_len++] = '\n';
-                merged[merged_len]   = '\0';
+                line = strtok(NULL, "\n");
             }
-            line = strtok(NULL, "\n");
+            free(list_copy);
+            free(list);
         }
-        free(list_copy);
-        free(list);
+
+        /* --- packages.json (mandatory) --- */
+        char *pjson = fetch_packages_json(mirror);
+        if (pjson) {
+            char *new_merged = merge_packages_json(merged_json, pjson);
+            free(pjson);
+            if (merged_json) free(merged_json);
+            merged_json = new_merged;
+        } else {
+            /* packages.json is required; warn that this mirror is non-conforming */
+            fprintf(stderr, "[capp] Warning: Mirror '%s' does not provide packages.json.\n"
+                            "         Mirrors must provide both packages.txt and packages.json.\n",
+                    mirror);
+        }
     }
 
     if (merged_len == 0) {
-        fprintf(stderr, "[capp] No package data fetched from any mirror.\n");
-        free(merged);
+        fprintf(stderr, "[capp] Error: No package data fetched from any mirror.\n");
+        free(merged_txt);
+        if (merged_json) free(merged_json);
         return 1;
     }
 
@@ -1087,12 +1614,34 @@ static int cmd_update(void) {
     FILE *out = fopen(available_path, "w");
     if (!out) {
         fprintf(stderr, "[capp] Error: Could not write available.txt.\n");
-        free(merged);
+        free(merged_txt);
+        if (merged_json) free(merged_json);
         return 1;
     }
-    fwrite(merged, 1, merged_len, out);
+    fwrite(merged_txt, 1, merged_len, out);
     fclose(out);
-    printf("[capp] Wrote %s\n", available_path);
+    VLOG(verbose, "[capp] Wrote %s\n", available_path);
+
+    /* Write packages.json (mandatory — error if nothing was fetched) */
+    if (merged_json) {
+        FILE *pf = fopen(packages_json_path, "w");
+        if (pf) {
+            fwrite(merged_json, 1, strlen(merged_json), pf);
+            fclose(pf);
+            VLOG(verbose, "[capp] Wrote %s\n", packages_json_path);
+        } else {
+            fprintf(stderr, "[capp] Error: Could not write packages.json.\n");
+            free(merged_json);
+            free(merged_txt);
+            return 1;
+        }
+        free(merged_json);
+    } else {
+        fprintf(stderr, "[capp] Error: No packages.json data obtained from any mirror.\n"
+                        "         Ensure your mirror provides a packages.json file.\n");
+        free(merged_txt);
+        return 1;
+    }
 
     /* Report upgradeable packages */
     char installed_path[MAX_PATH];
@@ -1101,12 +1650,12 @@ static int cmd_update(void) {
 
     FILE *inst = fopen(installed_path, "r");
     if (!inst) {
-        printf("[capp] No installed packages found.\n");
-        free(merged);
+        printf("\n[capp] No installed packages found.\n");
+        free(merged_txt);
         return 0;
     }
 
-    printf("\n[capp] Checking for upgrades...\n\n");
+    VLOG(verbose, "\n[capp] Checking for upgrades...\n\n");
     int upgrades_found = 0;
 
     char app_name[MAX_PATH];
@@ -1118,14 +1667,14 @@ static int cmd_update(void) {
         if (!get_installed_version(app_name, cur_ver, sizeof(cur_ver)))
             strcpy(cur_ver, "unknown");
 
-        PackageInfo *info = find_package_in_list(merged, app_name, NULL);
+        PackageInfo *info = find_package_in_list(merged_txt, app_name, NULL);
         if (info) {
             if (strcmp(cur_ver, "unknown") == 0 ||
                 compare_versions(info->version, cur_ver) > 0) {
                 printf("  %-24s  %s  →  %s\n", app_name, cur_ver, info->version);
                 upgrades_found = 1;
             } else {
-                printf("  %-24s  %s  (up to date)\n", app_name, cur_ver);
+                VLOG(verbose, "  %-24s  %s  (up to date)\n", app_name, cur_ver);
             }
             free(info->version); free(info->filename); free(info);
         } else {
@@ -1137,9 +1686,9 @@ static int cmd_update(void) {
     if (!upgrades_found)
         printf("\n[capp] All packages are up to date.\n");
     else
-        printf("\n[capp] Run 'capp upgrade' to upgrade all, or 'capp upgrade <AppName>' for one.\n");
+        VLOG(verbose, "\n[capp] Run 'capp upgrade' to upgrade all, or 'capp upgrade <AppName>' for one.\n");
 
-    free(merged);
+    free(merged_txt);
     return 0;
 }
 
@@ -1149,7 +1698,7 @@ static int cmd_update(void) {
  * Upgrade a single package by name. Internally: uninstall (skip prompt) + install-remote.
  * Returns 0 on success.
  */
-static int upgrade_single(const char *app_name, const char *available_data) {
+static int upgrade_single(const char *app_name, const char *available_data, int verbose) {
     char bundles_dir[MAX_PATH];
     if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
 
@@ -1170,7 +1719,7 @@ static int upgrade_single(const char *app_name, const char *available_data) {
         return 0;
     }
 
-    printf("\n[capp] Upgrading '%s'  %s  →  %s\n\n", app_name, cur_ver, info->version);
+    VLOG(verbose, "\n[capp] Upgrading '%s'  %s  →  %s\n\n", app_name, cur_ver, info->version);
     free(info->version); free(info->filename); free(info);
 
     /* Silently uninstall: re-use cmd_uninstall but we need to bypass the y/N prompt.
@@ -1198,7 +1747,7 @@ static int upgrade_single(const char *app_name, const char *available_data) {
                 snprintf(cmd, sizeof(cmd), RUN_UNINSTALL, extract_dir);
                 system(cmd);
             } else {
-                printf("[capp] Skipped uninstall script.\n");
+                VLOG(verbose, "[capp] Skipped uninstall script.\n");
             }
         }
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
@@ -1212,10 +1761,10 @@ static int upgrade_single(const char *app_name, const char *available_data) {
     remove_from_installed(app_name);
 
     /* Now install latest from mirror */
-    return cmd_install_remote(app_name);
+    return cmd_install_remote(app_name, NULL, verbose);
 }
 
-static int cmd_upgrade(const char *app_name_arg) {
+static int cmd_upgrade(const char *app_name_arg, int verbose) {
     /* Load available.txt */
     char bundles_dir[MAX_PATH];
     if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
@@ -1247,7 +1796,7 @@ static int cmd_upgrade(const char *app_name_arg) {
             free(available_data);
             return 1;
         }
-        ret = upgrade_single(app_name_arg, available_data);
+        ret = upgrade_single(app_name_arg, available_data, verbose);
     } else {
         /* Upgrade all installed packages */
         printf("=== CAPP — Upgrade All ===\n\n");
@@ -1275,7 +1824,7 @@ static int cmd_upgrade(const char *app_name_arg) {
         fclose(inst);
 
         for (int i = 0; i < count; i++) {
-            int r = upgrade_single(names[i], available_data);
+            int r = upgrade_single(names[i], available_data, verbose);
             if (r != 0) {
                 fprintf(stderr, "[capp] Failed to upgrade '%s'.\n", names[i]);
                 ret = 1;
@@ -1318,21 +1867,19 @@ static int cmd_search(const char *query) {
 
     printf("=== CAPP — Search: \"%s\" ===\n\n", query);
 
-    /* ----- Search available.txt ----- */
+    /* Load packages.json for rich metadata (may be NULL if not yet fetched) */
+    char *pjson = load_packages_json();
+
+    /* ----- Search available.txt + packages.json ----- */
     FILE *af = fopen(available_path, "r");
     if (!af) {
         fprintf(stderr, "[capp] available.txt not found. Run 'capp update' first.\n");
     } else {
-        char line[MAX_PATH];
-        int header_printed = 0;
-
-        /* Collect the latest version of each matching package for display */
-        /* We'll just print all matching lines, grouping by name */
-        /* Build a deduplicated list of matching package names + best version */
         typedef struct { char name[256]; char version[64]; char filename[256]; } Match;
         Match matches[256];
         int nmatch = 0;
 
+        char line[MAX_PATH];
         while (fgets(line, sizeof(line), af)) {
             line[strcspn(line, "\r\n")] = '\0';
             if (strlen(line) == 0) continue;
@@ -1341,9 +1888,16 @@ static int cmd_search(const char *query) {
             if (sscanf(line, "%255[^|]|%255[^|]|%255s", name, version, filename) < 3)
                 continue;
 
-            if (!icontains(name, query) && !icontains(filename, query)) continue;
+            /* Match against name, filename, and (if available) packages.json metadata */
+            int hit = icontains(name, query) || icontains(filename, query);
+            if (!hit && pjson) {
+                char obj_buf[32768];
+                if (find_pkg_json_obj(pjson, name, NULL, obj_buf, sizeof(obj_buf)))
+                    hit = icontains(obj_buf, query);
+            }
+            if (!hit) continue;
 
-            /* Update or add to matches list, keeping highest version */
+            /* Keep only latest version per package name */
             int found = 0;
             for (int i = 0; i < nmatch; i++) {
                 if (strcmp(matches[i].name, name) == 0) {
@@ -1364,21 +1918,35 @@ static int cmd_search(const char *query) {
         fclose(af);
 
         if (nmatch > 0) {
-            if (!header_printed) { printf("Available packages:\n"); header_printed = 1; }
+            printf("Available packages:\n");
             for (int i = 0; i < nmatch; i++) {
                 char inst_mark = is_app_installed(matches[i].name) ? '*' : ' ';
+                /* Try to get description from packages.json */
+                char desc[PM_VAL_LEN] = "";
+                char author[PM_VAL_LEN] = "";
+                if (pjson) {
+                    char obj_buf[32768];
+                    if (find_pkg_json_obj(pjson, matches[i].name,
+                                         matches[i].version, obj_buf, sizeof(obj_buf))) {
+                        json_get_string(obj_buf, "description", desc,   sizeof(desc));
+                        json_get_string(obj_buf, "author",      author, sizeof(author));
+                    }
+                }
                 printf("  %c %-24s  %-12s  %s\n",
-                       inst_mark, matches[i].name, matches[i].version, matches[i].filename);
+                       inst_mark, matches[i].name, matches[i].version,
+                       desc[0] ? desc : matches[i].filename);
+                if (author[0])
+                    printf("      Author: %s\n", author);
             }
             printf("\n  (* = installed)\n");
         } else {
-            printf("  No packages matching \"%s\" found in available.txt.\n", query);
+            printf("  No packages matching \"%s\" found.\n", query);
         }
     }
 
-    /* ----- Search local metadata.json files (installed packages only) ----- */
+    /* ----- Search installed packages via local metadata.json ----- */
     char data_dir[MAX_PATH];
-    if (!get_data_dir(data_dir, sizeof(data_dir))) return 0;
+    if (!get_data_dir(data_dir, sizeof(data_dir))) { if (pjson) free(pjson); return 0; }
 
     printf("\nInstalled packages matching \"%s\":\n", query);
     int local_found = 0;
@@ -1392,8 +1960,6 @@ static int cmd_search(const char *query) {
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
             if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-
-            /* Only consider packages that are in installed.txt */
             if (!is_app_installed(fd.cFileName)) continue;
 
             char meta_path[MAX_PATH];
@@ -1406,11 +1972,23 @@ static int cmd_search(const char *query) {
             fread(mbuf, 1, msz, mf); fclose(mf); mbuf[msz] = '\0';
 
             if (icontains(mbuf, query)) {
-                char name[256] = "", ver[64] = "", desc[512] = "";
-                json_get_string(mbuf, "name", name, sizeof(name));
-                json_get_string(mbuf, "version", ver, sizeof(ver));
-                json_get_string(mbuf, "description", desc, sizeof(desc));
+                char name[256]="", ver[64]="", desc[512]="", author[256]="";
+                json_get_string(mbuf, "name",    name, sizeof(name));
+                json_get_string(mbuf, "version", ver,  sizeof(ver));
+                /* Prefer packages.json for description/author */
+                if (pjson) {
+                    char obj_buf[32768];
+                    if (find_pkg_json_obj(pjson, name[0] ? name : fd.cFileName, NULL,
+                                         obj_buf, sizeof(obj_buf))) {
+                        json_get_string(obj_buf, "description", desc,   sizeof(desc));
+                        json_get_string(obj_buf, "author",      author, sizeof(author));
+                    }
+                }
+                /* Fallback to metadata.json */
+                if (!desc[0])   json_get_string(mbuf, "description", desc,   sizeof(desc));
+                if (!author[0]) json_get_string(mbuf, "author",      author, sizeof(author));
                 printf("  %-24s  %-12s  %s\n", name[0] ? name : fd.cFileName, ver, desc);
+                if (author[0]) printf("      Author: %s\n", author);
                 local_found = 1;
             }
             free(mbuf);
@@ -1423,8 +2001,6 @@ static int cmd_search(const char *query) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
             if (entry->d_name[0] == '.') continue;
-
-            /* Only consider packages that are in installed.txt */
             if (!is_app_installed(entry->d_name)) continue;
 
             char meta_path[MAX_PATH];
@@ -1437,12 +2013,23 @@ static int cmd_search(const char *query) {
             fread(mbuf, 1, msz, mf); fclose(mf); mbuf[msz] = '\0';
 
             if (icontains(mbuf, query)) {
-                char name[256] = "", ver[64] = "", desc[512] = "";
-                json_get_string(mbuf, "name", name, sizeof(name));
-                json_get_string(mbuf, "version", ver, sizeof(ver));
-                json_get_string(mbuf, "description", desc, sizeof(desc));
-                printf("  %-24s  %-12s  %s\n",
-                       name[0] ? name : entry->d_name, ver, desc);
+                char name[256]="", ver[64]="", desc[512]="", author[256]="";
+                json_get_string(mbuf, "name",    name, sizeof(name));
+                json_get_string(mbuf, "version", ver,  sizeof(ver));
+                /* Prefer packages.json for description/author */
+                if (pjson) {
+                    char obj_buf[32768];
+                    if (find_pkg_json_obj(pjson, name[0] ? name : entry->d_name, NULL,
+                                         obj_buf, sizeof(obj_buf))) {
+                        json_get_string(obj_buf, "description", desc,   sizeof(desc));
+                        json_get_string(obj_buf, "author",      author, sizeof(author));
+                    }
+                }
+                /* Fallback to metadata.json */
+                if (!desc[0])   json_get_string(mbuf, "description", desc,   sizeof(desc));
+                if (!author[0]) json_get_string(mbuf, "author",      author, sizeof(author));
+                printf("  %-24s  %-12s  %s\n", name[0] ? name : entry->d_name, ver, desc);
+                if (author[0]) printf("      Author: %s\n", author);
                 local_found = 1;
             }
             free(mbuf);
@@ -1454,7 +2041,17 @@ static int cmd_search(const char *query) {
     if (!local_found)
         printf("  (none)\n");
 
+    if (pjson) free(pjson);
     return 0;
+}
+
+/* Helper: get a value from PackageMetadata by key, return fallback if absent */
+static const char* pm_get_val(const PackageMetadata *pm, const char *key,
+                               const char *fallback) {
+    for (int i = 0; i < pm->count; i++)
+        if (strcmp(pm->keys[i], key) == 0 && pm->values[i][0] != '\0')
+            return pm->values[i];
+    return fallback;
 }
 
 /* ── Subcommand: show ────────────────────────────────────────────── */
@@ -1467,57 +2064,106 @@ static int cmd_show(const char *app_name_raw) {
 
     printf("=== CAPP \u2014 Show: %s ===\n\n", app_name);
 
-    /* Show metadata if the data directory exists for this package */
-    char app_data_dir[MAX_PATH];
-    get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir));
-    char meta_path[MAX_PATH];
-    snprintf(meta_path, sizeof(meta_path), "%s%smetadata.json", app_data_dir, PATH_SEP);
-
-    FILE *mf = fopen(meta_path, "r");
-    if (mf) {
-        fseek(mf, 0, SEEK_END); long msz = ftell(mf); fseek(mf, 0, SEEK_SET);
-        char *mbuf = malloc(msz + 1);
-        fread(mbuf, 1, msz, mf); fclose(mf); mbuf[msz] = '\0';
-
-        char name[256] = "", version[64] = "", author[256] = "", description[1024] = "";
-        json_get_string(mbuf, "name",        name,        sizeof(name));
-        json_get_string(mbuf, "version",     version,     sizeof(version));
-        json_get_string(mbuf, "author",      author,      sizeof(author));
-        json_get_string(mbuf, "description", description, sizeof(description));
-        free(mbuf);
-
-        printf("  Name        : %s\n", name[0]        ? name        : app_name);
-        printf("  Version     : %s\n", version[0]     ? version     : "unknown");
-        printf("  Author      : %s\n", author[0]      ? author      : "unknown");
-        printf("  Description : %s\n", description[0] ? description : "(none)");
-    } else {
-        printf("  (No metadata available \u2014 data directory not present)\n");
-    }
-
-    /* Installed status comes solely from installed.txt */
-    printf("  Installed   : %s\n", is_app_installed(app_name) ? "yes" : "no");
-
-    /* Check available.txt for the latest mirror version */
-    char bundles_dir[MAX_PATH];
-    get_bundles_dir(bundles_dir, sizeof(bundles_dir));
-    char available_path[MAX_PATH];
-    snprintf(available_path, sizeof(available_path), "%s%savailable.txt",
-             bundles_dir, PATH_SEP);
-
-    FILE *af = fopen(available_path, "r");
-    if (af) {
-        fseek(af, 0, SEEK_END); long asz = ftell(af); fseek(af, 0, SEEK_SET);
-        char *abuf = malloc(asz + 1);
-        fread(abuf, 1, asz, af); fclose(af); abuf[asz] = '\0';
-
-        PackageInfo *info = find_package_in_list(abuf, app_name, NULL);
-        if (info) {
-            printf("  Latest      : %s  (%s)\n", info->version, info->filename);
-            free(info->version); free(info->filename); free(info);
+    /* ── Source 1 (primary): packages.json from mirror ───────────────────── */
+    char *pjson = load_packages_json();
+    PackageMetadata pm;
+    pm.count = 0;
+    char pm_obj[32768];
+    int have_pm = 0;
+    if (pjson) {
+        /* Try exact installed version first, then latest */
+        char cur_ver[64] = "";
+        get_installed_version(app_name, cur_ver, sizeof(cur_ver));
+        if (cur_ver[0] && find_pkg_json_obj(pjson, app_name, cur_ver, pm_obj, sizeof(pm_obj))) {
+            pm = parse_package_metadata_obj(pm_obj);
+            have_pm = 1;
+        } else if (find_pkg_json_obj(pjson, app_name, NULL, pm_obj, sizeof(pm_obj))) {
+            pm = parse_package_metadata_obj(pm_obj);
+            have_pm = 1;
         }
-        free(abuf);
     }
 
+    /* ── Source 2 (fallback): local metadata.json ────────────────────────── */
+    char local_name[256]="", local_ver[64]="", local_author[256]="", local_desc[1024]="";
+    {
+        char app_data_dir[MAX_PATH];
+        get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir));
+        char meta_path[MAX_PATH];
+        snprintf(meta_path, sizeof(meta_path), "%s%smetadata.json", app_data_dir, PATH_SEP);
+        FILE *mf = fopen(meta_path, "r");
+        if (mf) {
+            fseek(mf, 0, SEEK_END); long msz = ftell(mf); fseek(mf, 0, SEEK_SET);
+            char *mbuf = malloc(msz + 1);
+            fread(mbuf, 1, msz, mf); fclose(mf); mbuf[msz] = '\0';
+            json_get_string(mbuf, "name",        local_name,   sizeof(local_name));
+            json_get_string(mbuf, "version",     local_ver,    sizeof(local_ver));
+            json_get_string(mbuf, "author",      local_author, sizeof(local_author));
+            json_get_string(mbuf, "description", local_desc,   sizeof(local_desc));
+            free(mbuf);
+        }
+    }
+
+    /* ── Merge: packages.json wins; metadata.json fills gaps ─────────────── */
+    /* For the four core fields, packages.json takes priority */
+    static const char EMPTY[] = "";
+    const char *pm_name   = have_pm ? pm_get_val(&pm, "name",        EMPTY) : EMPTY;
+    const char *pm_ver    = have_pm ? pm_get_val(&pm, "version",     EMPTY) : EMPTY;
+    const char *pm_author = have_pm ? pm_get_val(&pm, "author",      EMPTY) : EMPTY;
+    const char *pm_desc   = have_pm ? pm_get_val(&pm, "description", EMPTY) : EMPTY;
+
+    const char *disp_name   = pm_name[0]   ? pm_name   : (local_name[0]   ? local_name   : app_name);
+    const char *disp_ver    = pm_ver[0]    ? pm_ver    : (local_ver[0]    ? local_ver    : "unknown");
+    const char *disp_author = pm_author[0] ? pm_author : (local_author[0] ? local_author : "unknown");
+    const char *disp_desc   = pm_desc[0]   ? pm_desc   : (local_desc[0]   ? local_desc   : "(none)");
+
+    printf("  %-18s: %s\n", "Name",        disp_name);
+    printf("  %-18s: %s\n", "Version",     disp_ver);
+    printf("  %-18s: %s\n", "Author",      disp_author);
+    printf("  %-18s: %s\n", "Description", disp_desc);
+
+    /* Extra fields from packages.json (custom/optional, not the four above) */
+    if (have_pm) {
+        static const char *KNOWN[] = {"name","version","author","description","filename",NULL};
+        for (int i = 0; i < pm.count; i++) {
+            int skip = 0;
+            for (int k = 0; KNOWN[k]; k++)
+                if (strcmp(pm.keys[i], KNOWN[k]) == 0) { skip = 1; break; }
+            if (skip || pm.values[i][0] == '\0') continue;
+            char pretty_key[PM_KEY_LEN];
+            capitalise_key(pm.keys[i], pretty_key, sizeof(pretty_key));
+            printf("  %-18s: %s\n", pretty_key, pm.values[i]);
+        }
+    }
+
+    if (!have_pm && !local_name[0])
+        printf("  (No metadata available \u2014 run 'capp update' or install the package)\n");
+
+    /* Installed status: always from installed.txt */
+    printf("  %-18s: %s\n", "Installed", is_app_installed(app_name) ? "yes" : "no");
+
+    /* Latest version from available.txt */
+    {
+        char bundles_dir[MAX_PATH];
+        get_bundles_dir(bundles_dir, sizeof(bundles_dir));
+        char available_path[MAX_PATH];
+        snprintf(available_path, sizeof(available_path), "%s%savailable.txt",
+                 bundles_dir, PATH_SEP);
+        FILE *af = fopen(available_path, "r");
+        if (af) {
+            fseek(af, 0, SEEK_END); long asz = ftell(af); fseek(af, 0, SEEK_SET);
+            char *abuf = malloc(asz + 1);
+            fread(abuf, 1, asz, af); fclose(af); abuf[asz] = '\0';
+            PackageInfo *info = find_package_in_list(abuf, app_name, NULL);
+            if (info) {
+                printf("  %-18s: %s  (%s)\n", "Latest", info->version, info->filename);
+                free(info->version); free(info->filename); free(info);
+            }
+            free(abuf);
+        }
+    }
+
+    if (pjson) free(pjson);
+    pm_free(&pm);
     printf("\n");
     return 0;
 }
@@ -1529,7 +2175,7 @@ static int cmd_show(const char *app_name_raw) {
  * If it has been cleared from ~/.capp/data/<app>/instructions.*, re-extract
  * from the stored bundle in ~/.capp/bundles/.
  */
-static int cmd_man(const char *app_name_raw) {
+static int cmd_man(const char *app_name_raw, int verbose) {
     char app_name[MAX_PATH];
     strncpy(app_name, app_name_raw, sizeof(app_name) - 1);
     app_name[sizeof(app_name) - 1] = '\0';
@@ -1537,15 +2183,17 @@ static int cmd_man(const char *app_name_raw) {
 
     printf("=== CAPP — Manual: %s ===\n\n", app_name);
 
-    if (!is_app_installed(app_name)) {
-        fprintf(stderr, "[capp] Error: '%s' is not installed.\n", app_name);
-        return 1;
-    }
-
     char app_data_dir[MAX_PATH];
     get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir));
 
-    /* Look for an existing instructions.* in the data dir */
+    /* Ensure the data directory exists */
+    {
+        char mk[MAX_CMD];
+        snprintf(mk, sizeof(mk), MKDIR_CMD, app_data_dir);
+        system(mk);
+    }
+
+    /* ── Step 1: look for a cached instructions.* in the data dir ─────────── */
     char found_path[MAX_PATH];
     found_path[0] = '\0';
 
@@ -1576,10 +2224,8 @@ static int cmd_man(const char *app_name_raw) {
     }
 #endif
 
-    /* If not found locally, re-extract from bundle */
+    /* ── Step 2: not cached — try to obtain from a bundle ────────────────── */
     if (found_path[0] == '\0') {
-        printf("[capp] Instructions not in data directory. Re-extracting from bundle...\n");
-
         char bundles_dir[MAX_PATH];
         if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
 
@@ -1587,37 +2233,89 @@ static int cmd_man(const char *app_name_raw) {
         snprintf(bundle_path, sizeof(bundle_path), "%s%s%s.capp",
                  bundles_dir, PATH_SEP, app_name);
 
-        FILE *bf = fopen(bundle_path, "rb");
-        if (!bf) {
-            fprintf(stderr, "[capp] Error: Bundle file not found at '%s'.\n", bundle_path);
-            return 1;
-        }
-        fclose(bf);
-
         char extract_dir[MAX_PATH];
         snprintf(extract_dir, sizeof(extract_dir), "%s%s%s_man_tmp",
                  bundles_dir, PATH_SEP, app_name);
 
         char cmd[MAX_CMD];
-        snprintf(cmd, sizeof(cmd), UNZIP_CMD, bundle_path, extract_dir);
-        if (system(cmd) != 0) {
-            fprintf(stderr, "[capp] Error: Could not extract bundle.\n");
-            return 1;
+        FILE *bf = fopen(bundle_path, "rb");
+
+        if (bf) {
+            /* Installed: re-extract from stored bundle */
+            fclose(bf);
+            VLOG(verbose, "[capp] Instructions not cached. Re-extracting from stored bundle...\n");
+            snprintf(cmd, sizeof(cmd), UNZIP_CMD, bundle_path, extract_dir);
+            if (system(cmd) != 0) {
+                fprintf(stderr, "[capp] Error: Could not extract bundle.\n");
+                return 1;
+            }
+        } else {
+            /* Not installed: download from mirror using packages.json filename */
+            VLOG(verbose, "[capp] Package not installed. Fetching bundle from mirror...\n");
+
+            char *pjson = load_packages_json();
+            if (!pjson) {
+                fprintf(stderr, "[capp] Error: packages.json not found. Run 'capp update' first.\n");
+                return 1;
+            }
+
+            char obj_buf[32768];
+            if (!find_pkg_json_obj(pjson, app_name, NULL, obj_buf, sizeof(obj_buf))) {
+                fprintf(stderr, "[capp] Error: Package '%s' not found in packages.json.\n", app_name);
+                free(pjson);
+                return 1;
+            }
+
+            char filename[256] = "";
+            json_get_string(obj_buf, "filename", filename, sizeof(filename));
+            if (!filename[0]) {
+                fprintf(stderr, "[capp] Error: No filename entry for '%s' in packages.json.\n", app_name);
+                free(pjson);
+                return 1;
+            }
+            free(pjson);
+
+            /* Download to a temp .capp */
+            char temp_capp[MAX_PATH];
+            snprintf(temp_capp, sizeof(temp_capp), "%s%s%s_man.capp",
+                     bundles_dir, PATH_SEP, app_name);
+
+            Mirror *mirrors = get_mirrors();
+            int downloaded = 0;
+            for (int i = 0; mirrors[i].url[0] != '\0'; i++) {
+                if (download_capp_file(mirrors[i].url, filename, temp_capp)) {
+                    downloaded = 1;
+                    break;
+                }
+            }
+            if (!downloaded) {
+                fprintf(stderr, "[capp] Error: Could not download '%s' from any mirror.\n", app_name);
+                return 1;
+            }
+
+            snprintf(cmd, sizeof(cmd), UNZIP_CMD, temp_capp, extract_dir);
+            int ex = system(cmd);
+            snprintf(cmd, sizeof(cmd), REMOVE_FILE_CMD, temp_capp);
+            system(cmd);
+            if (ex != 0) {
+                fprintf(stderr, "[capp] Error: Could not extract downloaded bundle.\n");
+                return 1;
+            }
         }
 
-        /* Get current version for metadata */
+        /* Get version for metadata (may be empty for uninstalled) */
         char cur_ver[64] = "unknown";
         get_installed_version(app_name, cur_ver, sizeof(cur_ver));
 
-        int rc = open_instructions(extract_dir, app_name, cur_ver);
+        int rc = open_instructions(extract_dir, app_name, cur_ver, 0);
 
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
         system(cmd);
         return rc;
     }
 
-    /* Open the cached file */
-    printf("[capp] Opening: %s\n", found_path);
+    /* ── Step 3: open the cached file ────────────────────────────────────── */
+    VLOG(verbose, "[capp] Opening: %s\n", found_path);
 
     if (is_executable_file(found_path)) {
         fprintf(stderr, "[capp] SECURITY ERROR: instructions file is an executable. Aborting.\n");
@@ -1654,7 +2352,7 @@ static int cmd_man(const char *app_name_raw) {
  * List all packages in available.txt (one per line, showing the latest
  * version of each unique package name).
  */
-static int cmd_list(void) {
+static int cmd_list(int verbose) {
     char bundles_dir[MAX_PATH];
     if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
 
@@ -1662,7 +2360,7 @@ static int cmd_list(void) {
     snprintf(available_path, sizeof(available_path), "%s%savailable.txt",
              bundles_dir, PATH_SEP);
 
-    printf("=== CAPP -- Available Packages ===\n\n");
+    printf("=== CAPP — Available Packages ===\n\n");
 
     FILE *af = fopen(available_path, "r");
     if (!af) {
@@ -1705,10 +2403,27 @@ static int cmd_list(void) {
         return 0;
     }
 
-    for (int i = 0; i < nentries; i++)
-        printf("  %-24s  %s\n", entries[i].name, entries[i].version);
+    /* Load packages.json for verbose descriptions */
+    char *pjson = verbose ? load_packages_json() : NULL;
 
-    printf("\n  %d package(s) available.\n", nentries);
+    for (int i = 0; i < nentries; i++) {
+        char inst_mark = is_app_installed(entries[i].name) ? '*' : ' ';
+        printf("  %c %-24s  %s\n", inst_mark, entries[i].name, entries[i].version);
+        if (verbose && pjson) {
+            char obj_buf[32768];
+            if (find_pkg_json_obj(pjson, entries[i].name, entries[i].version,
+                                  obj_buf, sizeof(obj_buf))) {
+                char desc[PM_VAL_LEN]="", author[PM_VAL_LEN]="";
+                json_get_string(obj_buf, "description", desc,   sizeof(desc));
+                json_get_string(obj_buf, "author",      author, sizeof(author));
+                if (desc[0])   printf("      %s\n", desc);
+                if (author[0]) printf("      Author: %s\n", author);
+            }
+        }
+    }
+
+    if (pjson) free(pjson);
+    printf("\n  %d package(s) available.  (* = installed)\n", nentries);
     return 0;
 }
 
@@ -1717,7 +2432,7 @@ static int cmd_list(void) {
 /*
  * List all packages recorded in installed.txt.
  */
-static int cmd_list_installed(void) {
+static int cmd_list_installed(int verbose) {
     char bundles_dir[MAX_PATH];
     if (!get_bundles_dir(bundles_dir, sizeof(bundles_dir))) return 1;
 
@@ -1725,7 +2440,7 @@ static int cmd_list_installed(void) {
     snprintf(installed_path, sizeof(installed_path), "%s%sinstalled.txt",
              bundles_dir, PATH_SEP);
 
-    printf("=== CAPP -- Installed Packages ===\n\n");
+    printf("=== CAPP — Installed Packages ===\n\n");
 
     FILE *f = fopen(installed_path, "r");
     if (!f) {
@@ -1733,15 +2448,35 @@ static int cmd_list_installed(void) {
         return 0;
     }
 
+    /* Load packages.json once for verbose version/description lookup */
+    char *pjson = verbose ? load_packages_json() : NULL;
+
     int count = 0;
     char line[MAX_PATH];
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = '\0';
         if (strlen(line) == 0) continue;
-        printf("  %s\n", line);
+
+        if (verbose && pjson) {
+            /* Show installed version from metadata.json, desc from packages.json */
+            char inst_ver[64] = "";
+            get_installed_version(line, inst_ver, sizeof(inst_ver));
+            char obj_buf[32768];
+            char desc[PM_VAL_LEN] = "", author[PM_VAL_LEN] = "";
+            if (find_pkg_json_obj(pjson, line, NULL, obj_buf, sizeof(obj_buf))) {
+                json_get_string(obj_buf, "description", desc,   sizeof(desc));
+                json_get_string(obj_buf, "author",      author, sizeof(author));
+            }
+            printf("  %-24s  %s\n", line, inst_ver[0] ? inst_ver : "unknown");
+            if (desc[0])   printf("      %s\n", desc);
+            if (author[0]) printf("      Author: %s\n", author);
+        } else {
+            printf("  %s\n", line);
+        }
         count++;
     }
     fclose(f);
+    if (pjson) free(pjson);
 
     if (count == 0)
         printf("  (no packages installed)\n");
@@ -1799,6 +2534,28 @@ static int cmd_clear_cache(void) {
             } while (FindNextFileA(sh, &sfd));
             FindClose(sh);
         }
+        /* Remove the app data dir if it is now empty */
+        {
+            char empty_check[MAX_PATH];
+            snprintf(empty_check, sizeof(empty_check), "%s\\*", app_dir);
+            WIN32_FIND_DATAA efd;
+            HANDLE eh = FindFirstFileA(empty_check, &efd);
+            int has_files = 0;
+            if (eh != INVALID_HANDLE_VALUE) {
+                do {
+                    if (strcmp(efd.cFileName, ".") != 0 && strcmp(efd.cFileName, "..") != 0) {
+                        has_files = 1; break;
+                    }
+                } while (FindNextFileA(eh, &efd));
+                FindClose(eh);
+            }
+            if (!has_files) {
+                char rm_cmd[MAX_CMD];
+                snprintf(rm_cmd, sizeof(rm_cmd), RMDIR_CMD, app_dir);
+                if (system(rm_cmd) == 0)
+                    printf("[capp] Removed empty data directory: %s\n", fd.cFileName);
+            }
+        }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
@@ -1833,6 +2590,24 @@ static int cmd_clear_cache(void) {
             }
         }
         closedir(sub);
+        /* Remove the app data dir if it is now empty */
+        {
+            DIR *check = opendir(app_dir);
+            int has_files = 0;
+            if (check) {
+                struct dirent *ce;
+                while ((ce = readdir(check)) != NULL) {
+                    if (ce->d_name[0] != '.') { has_files = 1; break; }
+                }
+                closedir(check);
+            }
+            if (!has_files) {
+                char rm_cmd[MAX_CMD];
+                snprintf(rm_cmd, sizeof(rm_cmd), RMDIR_CMD, app_dir);
+                if (system(rm_cmd) == 0)
+                    printf("[capp] Removed empty data directory: %s\n", app_entry->d_name);
+            }
+        }
     }
     closedir(dir);
 #endif
@@ -1849,16 +2624,21 @@ static int cmd_clear_cache(void) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s create                       — bundle a folder into a .capp file\n", prog);
-    fprintf(stderr, "  %s install  <App.capp>          — install a .capp bundle\n", prog);
-    fprintf(stderr, "  %s install-remote <AppName>     — install latest version from mirror\n", prog);
-    fprintf(stderr, "  %s uninstall <AppName>          — uninstall a previously installed app\n", prog);
-    fprintf(stderr, "  %s update                       — refresh available.txt from mirrors\n", prog);
-    fprintf(stderr, "  %s upgrade [AppName]            — upgrade one or all packages\n", prog);
-    fprintf(stderr, "  %s search <query>               — search available and installed packages\n", prog);
-    fprintf(stderr, "  %s show <AppName>               — show package metadata\n", prog);
-    fprintf(stderr, "  %s man <AppName>                — open instructions for an installed app\n", prog);
-    fprintf(stderr, "  %s clear-cache                  — remove cached instructions files\n", prog);
+    fprintf(stderr, "  %s create                                   — bundle a folder into a .capp file\n", prog);
+    fprintf(stderr, "  %s install  [-V] <App.capp>                 — install a .capp bundle\n", prog);
+    fprintf(stderr, "  %s install-remote [-V] [-v <ver>] <AppName> — install from mirror\n", prog);
+    fprintf(stderr, "  %s uninstall [-V] <AppName>                 — uninstall a previously installed app\n", prog);
+    fprintf(stderr, "  %s update [-V]                              — refresh package indexes from mirrors\n", prog);
+    fprintf(stderr, "  %s upgrade [-V] [AppName]                   — upgrade one or all packages\n", prog);
+    fprintf(stderr, "  %s list [--verbose]                         — list all available packages\n", prog);
+    fprintf(stderr, "  %s list-installed [-V]                      — list all installed packages\n", prog);
+    fprintf(stderr, "  %s search <query>                           — search available and installed packages\n", prog);
+    fprintf(stderr, "  %s show <AppName>                           — show package metadata\n", prog);
+    fprintf(stderr, "  %s man [-V] <AppName>                       — open instructions for a package\n", prog);
+    fprintf(stderr, "  %s clear-cache                              — remove cached instructions files\n", prog);
+    fprintf(stderr, "\nFlags:\n");
+    fprintf(stderr, "  -V, --verbose   show detailed progress output\n");
+    fprintf(stderr, "  -v <version>    (install-remote only) install a specific version\n");
     fprintf(stderr, "\nEnvironment variables:\n");
     fprintf(stderr, "  CAPP_MIRROR=https://...  — override default mirror URL\n");
 }
@@ -1874,28 +2654,67 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "install") == 0) {
-        if (argc != 3) { fprintf(stderr, "Usage: %s install <App.capp>\n", argv[0]); return 1; }
-        return cmd_install(argv[2]);
+        /* Usage: install [-V|--verbose] <App.capp> */
+        const char *bundle_arg = NULL;
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else if (!bundle_arg)          bundle_arg = argv[i];
+            else { fprintf(stderr, "Usage: %s install [-V|--verbose] <App.capp>\n", argv[0]); return 1; }
+        }
+        if (!bundle_arg) { fprintf(stderr, "Usage: %s install [-V|--verbose] <App.capp>\n", argv[0]); return 1; }
+        return cmd_install(bundle_arg, verbose);
     }
 
     if (strcmp(subcmd, "install-remote") == 0) {
-        if (argc != 3) { fprintf(stderr, "Usage: %s install-remote <AppName>\n", argv[0]); return 1; }
-        return cmd_install_remote(argv[2]);
+        /* Usage: install-remote [-V|--verbose] [-v <version>] <AppName> */
+        const char *pkg_arg = NULL, *ver_arg = NULL;
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) { verbose = 1; }
+            else if (is_version_flag(argv[i])) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: -v requires a version argument.\n"); return 1; }
+                ver_arg = argv[++i];
+            } else if (!pkg_arg) { pkg_arg = argv[i]; }
+            else { fprintf(stderr, "Usage: %s install-remote [-V|--verbose] [-v <version>] <AppName>\n", argv[0]); return 1; }
+        }
+        if (!pkg_arg) { fprintf(stderr, "Usage: %s install-remote [-V|--verbose] [-v <version>] <AppName>\n", argv[0]); return 1; }
+        return cmd_install_remote(pkg_arg, ver_arg, verbose);
     }
 
     if (strcmp(subcmd, "uninstall") == 0) {
-        if (argc != 3) { fprintf(stderr, "Usage: %s uninstall <AppName>\n", argv[0]); return 1; }
-        return cmd_uninstall(argv[2]);
+        /* Usage: uninstall [-V|--verbose] <AppName> */
+        const char *name_arg = NULL;
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else if (!name_arg)            name_arg = argv[i];
+            else { fprintf(stderr, "Usage: %s uninstall [-V|--verbose] <AppName>\n", argv[0]); return 1; }
+        }
+        if (!name_arg) { fprintf(stderr, "Usage: %s uninstall [-V|--verbose] <AppName>\n", argv[0]); return 1; }
+        return cmd_uninstall(name_arg, verbose);
     }
 
     if (strcmp(subcmd, "update") == 0) {
-        if (argc != 2) { fprintf(stderr, "Usage: %s update\n", argv[0]); return 1; }
-        return cmd_update();
+        /* Usage: update [-V|--verbose] */
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else { fprintf(stderr, "Usage: %s update [-V|--verbose]\n", argv[0]); return 1; }
+        }
+        return cmd_update(verbose);
     }
 
     if (strcmp(subcmd, "upgrade") == 0) {
-        if (argc > 3) { fprintf(stderr, "Usage: %s upgrade [AppName]\n", argv[0]); return 1; }
-        return cmd_upgrade(argc == 3 ? argv[2] : NULL);
+        /* Usage: upgrade [-V|--verbose] [AppName] */
+        const char *name_arg = NULL;
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else if (!name_arg)            name_arg = argv[i];
+            else { fprintf(stderr, "Usage: %s upgrade [-V|--verbose] [AppName]\n", argv[0]); return 1; }
+        }
+        return cmd_upgrade(name_arg, verbose);
     }
 
     if (strcmp(subcmd, "search") == 0) {
@@ -1909,18 +2728,32 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "man") == 0) {
-        if (argc != 3) { fprintf(stderr, "Usage: %s man <AppName>\n", argv[0]); return 1; }
-        return cmd_man(argv[2]);
+        /* Usage: man [-V|--verbose] <AppName> */
+        const char *name_arg = NULL;
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else if (!name_arg)            name_arg = argv[i];
+            else { fprintf(stderr, "Usage: %s man [-V|--verbose] <AppName>\n", argv[0]); return 1; }
+        }
+        if (!name_arg) { fprintf(stderr, "Usage: %s man [-V|--verbose] <AppName>\n", argv[0]); return 1; }
+        return cmd_man(name_arg, verbose);
     }
 
     if (strcmp(subcmd, "list") == 0) {
-        if (argc != 2) { fprintf(stderr, "Usage: %s list\n", argv[0]); return 1; }
-        return cmd_list();
+        if (argc > 3) { fprintf(stderr, "Usage: %s list [--verbose]\n", argv[0]); return 1; }
+        int verbose = (argc == 3 && strcmp(argv[2], "--verbose") == 0);
+        return cmd_list(verbose);
     }
 
     if (strcmp(subcmd, "list-installed") == 0) {
-        if (argc != 2) { fprintf(stderr, "Usage: %s list-installed\n", argv[0]); return 1; }
-        return cmd_list_installed();
+        /* Usage: list-installed [-V|--verbose] */
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else { fprintf(stderr, "Usage: %s list-installed [-V|--verbose]\n", argv[0]); return 1; }
+        }
+        return cmd_list_installed(verbose);
     }
 
     if (strcmp(subcmd, "clear-cache") == 0) {
