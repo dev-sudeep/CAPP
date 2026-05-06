@@ -12,7 +12,7 @@
  *   capp uninstall <AppName>               — uninstall a previously installed app
  *   capp update                            — refresh available.txt + packages.json, show upgrades
  *   capp upgrade [AppName]                 — upgrade one or all installed packages
- *   capp list [--verbose]                  — list all available packages
+ *   capp list [-V|--verbose]               — list all available packages
  *   capp list-installed                    — list all installed packages
  *   capp search <query>                    — search available and installed packages
  *   capp show <AppName>                    — show full metadata for a package
@@ -2635,16 +2635,16 @@ static int cmd_clear_cache(void) {
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s create                                   — bundle a folder into a .capp file\n", prog);
-    fprintf(stderr, "  %s install  [-V] <App.capp>                 — install a .capp bundle\n", prog);
-    fprintf(stderr, "  %s install-remote [-V] [-v <ver>] <AppName> — install from mirror\n", prog);
-    fprintf(stderr, "  %s uninstall [-V] <AppName>                 — uninstall a previously installed app\n", prog);
-    fprintf(stderr, "  %s update [-V]                              — refresh package indexes from mirrors\n", prog);
-    fprintf(stderr, "  %s upgrade [-V] [AppName]                   — upgrade one or all packages\n", prog);
-    fprintf(stderr, "  %s list [--verbose]                         — list all available packages\n", prog);
-    fprintf(stderr, "  %s list-installed [-V]                      — list all installed packages\n", prog);
+    fprintf(stderr, "  %s install  [-V|--verbose] <App.capp>       — install a .capp bundle\n", prog);
+    fprintf(stderr, "  %s install-remote [-V|--verbose] [-v <ver>] <AppName> — install from mirror\n", prog);
+    fprintf(stderr, "  %s uninstall [-V|--verbose] <AppName>       — uninstall a previously installed app\n", prog);
+    fprintf(stderr, "  %s update [-V|--verbose]                    — refresh package indexes from mirrors\n", prog);
+    fprintf(stderr, "  %s upgrade [-V|--verbose] [AppName]         — upgrade one or all packages\n", prog);
+    fprintf(stderr, "  %s list [-V|--verbose]                      — list all available packages\n", prog);
+    fprintf(stderr, "  %s list-installed [-V|--verbose]            — list all installed packages\n", prog);
     fprintf(stderr, "  %s search <query>                           — search available and installed packages\n", prog);
     fprintf(stderr, "  %s show <AppName>                           — show package metadata\n", prog);
-    fprintf(stderr, "  %s man [-V] <AppName>                       — open instructions for a package\n", prog);
+    fprintf(stderr, "  %s man [-V|--verbose] <AppName>             — open instructions for a package\n", prog);
     fprintf(stderr, "  %s clear-cache                              — remove cached instructions files\n", prog);
     fprintf(stderr, "\nFlags:\n");
     fprintf(stderr, "  -V, --verbose   show detailed progress output\n");
@@ -2751,8 +2751,12 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "list") == 0) {
-        if (argc > 3) { fprintf(stderr, "Usage: %s list [--verbose]\n", argv[0]); return 1; }
-        int verbose = (argc == 3 && strcmp(argv[2], "--verbose") == 0);
+        if (argc > 3) { fprintf(stderr, "Usage: %s list [-V|--verbose]\n", argv[0]); return 1; }
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else { fprintf(stderr, "Usage: %s list [-V|--verbose]\n", argv[0]); return 1; }
+        }
         return cmd_list(verbose);
     }
 
