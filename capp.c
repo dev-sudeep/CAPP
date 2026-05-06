@@ -1279,6 +1279,12 @@ static int cmd_install_with_version(const char *bundle, const char *version, int
     char app_name[MAX_PATH];
     make_app_name(bundle, app_name, sizeof(app_name));
 
+    if (is_app_installed(app_name)) {
+        fprintf(stderr, "[capp] Error: '%s' is already installed.\n", app_name);
+        fprintf(stderr, "       Use 'capp upgrade %s' or uninstall it first.\n", app_name);
+        return 1;
+    }
+
     char extract_dir[MAX_PATH];
     {
         char rel[MAX_PATH];
@@ -1370,6 +1376,17 @@ static int cmd_install(const char *bundle, int verbose) {
 /* ── Subcommand: install-remote ────────────────────────────────────────────── */
 
 static int cmd_install_remote(const char *pkg_name, const char *pkg_version, int verbose) {
+    char pkg_name_norm[MAX_PATH];
+    strncpy(pkg_name_norm, pkg_name, sizeof(pkg_name_norm) - 1);
+    pkg_name_norm[sizeof(pkg_name_norm) - 1] = '\0';
+    strip_capp_ext(pkg_name_norm);
+
+    if (is_app_installed(pkg_name_norm)) {
+        fprintf(stderr, "[capp] Error: '%s' is already installed.\n", pkg_name_norm);
+        fprintf(stderr, "       Use 'capp upgrade %s' or uninstall it first.\n", pkg_name_norm);
+        return 1;
+    }
+
     Mirror *mirrors = get_mirrors();
     char *packages_list = NULL;
     PackageInfo *pkg_info = NULL;
@@ -1378,7 +1395,7 @@ static int cmd_install_remote(const char *pkg_name, const char *pkg_version, int
     int success = 0;
 
     printf("=== CAPP — Install from Mirror ===\n");
-    printf("[capp] Package : %s\n", pkg_name);
+    printf("[capp] Package : %s\n", pkg_name_norm);
     printf("[capp] Version : %s\n\n", pkg_version ? pkg_version : "(latest)");
 
     for (int i = 0; mirrors[i].url[0] != '\0'; i++) {
@@ -1387,7 +1404,7 @@ static int cmd_install_remote(const char *pkg_name, const char *pkg_version, int
         packages_list = fetch_packages_list(mirror);
         if (!packages_list) continue;
 
-        pkg_info = find_package_in_list(packages_list, pkg_name, pkg_version);
+        pkg_info = find_package_in_list(packages_list, pkg_name_norm, pkg_version);
 
         if (pkg_info) {
             printf("[capp] Found version: %s\n", pkg_info->version);
@@ -1413,7 +1430,7 @@ static int cmd_install_remote(const char *pkg_name, const char *pkg_version, int
     }
 
     if (!success) {
-        fprintf(stderr, "[capp] Package '%s' not found on any mirror.\n", pkg_name);
+        fprintf(stderr, "[capp] Package '%s' not found on any mirror.\n", pkg_name_norm);
         return 1;
     }
 
@@ -2185,13 +2202,6 @@ static int cmd_man(const char *app_name_raw, int verbose) {
 
     char app_data_dir[MAX_PATH];
     get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir));
-
-    /* Ensure the data directory exists */
-    {
-        char mk[MAX_CMD];
-        snprintf(mk, sizeof(mk), MKDIR_CMD, app_data_dir);
-        system(mk);
-    }
 
     /* ── Step 1: look for a cached instructions.* in the data dir ─────────── */
     char found_path[MAX_PATH];

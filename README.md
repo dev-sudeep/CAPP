@@ -51,16 +51,16 @@ If no `metadata.json` is provided in the bundle, CAPP generates a minimal one wi
 | Subcommand | Arguments | Description |
 |---|---|---|
 | `create` | — | Interactively bundle a folder into a `.capp` file |
-| `install` | `<App.capp>` | Install a bundle from a local file |
-| `install-remote` | `<AppName>` | Install the latest version of a package from a mirror |
-| `uninstall` | `<AppName>` | Uninstall a previously installed app |
-| `update` | — | Refresh `available.txt` from all mirrors, show upgradeable packages |
-| `upgrade` | `[AppName]` | Upgrade one package, or all installed packages if no argument given |
-| `list` | — | List all packages available on the configured mirrors |
-| `list-installed` | — | List all installed packages |
+| `install` | `[-V\|--verbose] <App.capp>` | Install a bundle from a local file |
+| `install-remote` | `[-V\|--verbose] [-v <version>] <AppName>` | Install the latest version by default, or a specific version with `-v` |
+| `uninstall` | `[-V\|--verbose] <AppName>` | Uninstall a previously installed app |
+| `update` | `[-V\|--verbose]` | Refresh `available.txt` from all mirrors, show upgradeable packages |
+| `upgrade` | `[-V\|--verbose] [AppName]` | Upgrade one package, or all installed packages if no argument given |
+| `list` | `[--verbose]` | List all packages available on the configured mirrors |
+| `list-installed` | `[-V\|--verbose]` | List all installed packages |
 | `search` | `<query>` | Search available and installed packages by name or metadata |
 | `show` | `<AppName>` | Show metadata and install status for any package |
-| `man` | `<AppName>` | Open the instructions file for an installed app |
+| `man` | `[-V\|--verbose] <AppName>` | Open instructions for a package |
 | `clear-cache` | — | Remove cached instructions files (preserves metadata) |
 
 ---
@@ -92,24 +92,27 @@ capp install MyApp.capp
 
 Steps performed:
 
-1. Creates `~/.capp/bundles/`, `~/.capp/bin/`, and `~/.capp/data/` if needed
-2. Extracts the `.capp` archive to a temporary directory
-3. Displays the full contents of `install.sh` (or `install.bat` on Windows)
-4. Prompts you to confirm before proceeding (`[y/N]`)
-5. Runs the install script
-6. Saves `metadata.json` to `~/.capp/data/AppName/`
-7. Opens `instructions.<ext>` (if present) with your default viewer and caches it in `~/.capp/data/AppName/`
-8. Moves the `.capp` bundle to `~/.capp/bundles/` for use by the uninstaller and `man` command
-9. Registers the app in `~/.capp/bundles/installed.txt`
-10. Cleans up the temporary extraction directory
+1. Verifies the package is not already installed (if it is, install is aborted)
+2. Creates `~/.capp/bundles/`, `~/.capp/bin/`, and `~/.capp/data/` if needed
+3. Extracts the `.capp` archive to a temporary directory
+4. Displays the full contents of `install.sh` (or `install.bat` on Windows)
+5. Prompts you to confirm before proceeding (`[y/N]`)
+6. Runs the install script
+7. Saves `metadata.json` to `~/.capp/data/AppName/`
+8. Opens `instructions.<ext>` (if present) with your default viewer and caches it in `~/.capp/data/AppName/`
+9. Moves the `.capp` bundle to `~/.capp/bundles/` for use by the uninstaller and `man` command
+10. Registers the app in `~/.capp/bundles/installed.txt`
+11. Cleans up the temporary extraction directory
 
 ### From a Mirror
 
 ```sh
 capp install-remote MyApp
+capp install-remote -v 1.2.0 MyApp
 ```
 
-Fetches the latest version from the configured mirror and installs it, performing the same steps as a local install.
+By default, CAPP resolves and installs the latest semantic version from the configured mirror. Pass `-v <version>` to install a specific version instead. `-V` / `--verbose` can be added to show detailed progress.
+If the package is already installed, `install-remote` exits with an error instead of reinstalling.
 
 ---
 
@@ -240,9 +243,10 @@ Displays full metadata for any package (installed or not), sourcing each field i
 
 ```sh
 capp man MyApp
+capp man --verbose MyApp
 ```
 
-Opens the cached instructions file from `~/.capp/data/MyApp/`. If the file was cleared by `clear-cache`, it is automatically re-extracted from the stored bundle in `~/.capp/bundles/` before opening. On Linux without `xdg-open`, plain-text instruction files are printed directly to the terminal.
+Opens the cached instructions file from `~/.capp/data/MyApp/`. If the file was cleared by `clear-cache`, it is automatically re-extracted from the stored bundle in `~/.capp/bundles/` before opening. If the package name does not exist (neither installed nor available via `packages.json`), `capp man` exits with an error and does **not** create `~/.capp/data/<AppName>/`. On Linux without `xdg-open`, plain-text instruction files are printed directly to the terminal.
 
 ---
 
