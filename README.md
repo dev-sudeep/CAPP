@@ -141,7 +141,7 @@ capp uninstall MyApp.capp
 capp update
 ```
 
-Fetches `packages.txt` from every configured mirror, merges the results (deduplicating by name and version) into `~/.capp/bundles/available.txt`, then reports which installed packages have a newer version available on the mirror.
+Fetches `packages.txt` and `packages.json` from every configured mirror, merges the results (deduplicating by name and version) into `~/.capp/bundles/available.txt` and `~/.capp/bundles/packages.json`, then reports which installed packages have a newer version available on the mirror.
 
 ```
 === CAPP — Update ===
@@ -289,6 +289,7 @@ gcc -o capp.exe capp.c
 | `~/.capp/bundles/` | Stored `.capp` files for installed apps |
 | `~/.capp/bundles/installed.txt` | Registry of installed app names |
 | `~/.capp/bundles/available.txt` | Merged mirror package list (from `capp update`) |
+| `~/.capp/bundles/packages.json` | Merged mirror metadata (from `capp update`) |
 | `~/.capp/bin/` | App executables (managed by install scripts) |
 | `~/.capp/data/<AppName>/metadata.json` | Package metadata |
 | `~/.capp/data/<AppName>/instructions.*` | Cached instructions (clearable) |
@@ -352,6 +353,27 @@ OtherApp|3.1.0|OtherApp-3.1.0.capp
 
 CAPP automatically selects the highest semantic version when installing or upgrading.
 
+### packages.json Format (Required)
+
+`packages.json` is required on mirrors and provides richer metadata (description, author, custom fields) and the canonical `filename` for downloads.
+
+```json
+{
+  "packages": [
+    {
+      "name": "MyApp",
+      "version": "2.0.0",
+      "filename": "MyApp-2.0.0.capp",
+      "author": "Your Name",
+      "description": "A short description of what the app does.",
+      "homepage": "https://example.com"
+    }
+  ]
+}
+```
+
+Extra fields are preserved and surfaced where relevant; only `name`, `version`, `filename`, `author`, and `description` are required for built-in features.
+
 ---
 
 ## Contributing Packages to the CAPP Mirror
@@ -389,6 +411,7 @@ Open a pull request against `dev-sudeep/CAPP-mirror:main`. The maintainer will v
 ```
 my-pkg-mirror/
 ├── packages.txt
+├── packages.json
 └── packages/
     ├── MyApp-1.0.0.capp
     └── MyApp-2.0.0.capp
