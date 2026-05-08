@@ -38,7 +38,7 @@ Thanks for your interest in contributing! The process is simple: fork the repo, 
    ```
 
 8. **Open a pull request**
-   - Go to your fork on GitHub and open a PR against **dev-sudeep/CAPP** on the **main** branch.
+   - Go to your fork on GitHub and open a PR against the upstream repository on the **main** branch.
    - Provide a clear summary and any relevant details.
 
 ## Questions
