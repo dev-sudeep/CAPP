@@ -2102,6 +2102,9 @@ static int cmd_show(const char *app_name_raw) {
 
     /* ── Source 2 (fallback): local metadata.json ────────────────────────── */
     char local_name[256]="", local_ver[64]="", local_author[256]="", local_desc[1024]="";
+    PackageMetadata local_pm;
+    local_pm.count = 0;
+    int have_local_pm = 0;
     {
         char app_data_dir[MAX_PATH];
         get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir));
@@ -2116,6 +2119,8 @@ static int cmd_show(const char *app_name_raw) {
             json_get_string(mbuf, "version",     local_ver,    sizeof(local_ver));
             json_get_string(mbuf, "author",      local_author, sizeof(local_author));
             json_get_string(mbuf, "description", local_desc,   sizeof(local_desc));
+            local_pm = parse_package_metadata_obj(mbuf);
+            have_local_pm = (local_pm.count > 0);
             free(mbuf);
         }
     }
@@ -2138,17 +2143,31 @@ static int cmd_show(const char *app_name_raw) {
     printf("  %-18s: %s\n", "Author",      disp_author);
     printf("  %-18s: %s\n", "Description", disp_desc);
 
-    /* Extra fields from packages.json (custom/optional, not the four above) */
-    if (have_pm) {
+    /* Extra fields from packages.json and metadata.json (custom/optional, not the four above) */
+    if (have_pm || have_local_pm) {
         static const char *KNOWN[] = {"name","version","author","description","filename",NULL};
-        for (int i = 0; i < pm.count; i++) {
-            int skip = 0;
-            for (int k = 0; KNOWN[k]; k++)
-                if (strcmp(pm.keys[i], KNOWN[k]) == 0) { skip = 1; break; }
-            if (skip || pm.values[i][0] == '\0') continue;
-            char pretty_key[PM_KEY_LEN];
-            capitalise_key(pm.keys[i], pretty_key, sizeof(pretty_key));
-            printf("  %-18s: %s\n", pretty_key, pm.values[i]);
+        if (have_pm) {
+            for (int i = 0; i < pm.count; i++) {
+                int skip = 0;
+                for (int k = 0; KNOWN[k]; k++)
+                    if (strcmp(pm.keys[i], KNOWN[k]) == 0) { skip = 1; break; }
+                if (skip || pm.values[i][0] == '\0') continue;
+                char pretty_key[PM_KEY_LEN];
+                capitalise_key(pm.keys[i], pretty_key, sizeof(pretty_key));
+                printf("  %-18s: %s\n", pretty_key, pm.values[i]);
+            }
+        }
+        if (have_local_pm) {
+            for (int i = 0; i < local_pm.count; i++) {
+                int skip = 0;
+                for (int k = 0; KNOWN[k]; k++)
+                    if (strcmp(local_pm.keys[i], KNOWN[k]) == 0) { skip = 1; break; }
+                if (skip || local_pm.values[i][0] == '\0') continue;
+                if (have_pm && pm_get_val(&pm, local_pm.keys[i], EMPTY)[0] != '\0') continue;
+                char pretty_key[PM_KEY_LEN];
+                capitalise_key(local_pm.keys[i], pretty_key, sizeof(pretty_key));
+                printf("  %-18s: %s\n", pretty_key, local_pm.values[i]);
+            }
         }
     }
 
