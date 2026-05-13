@@ -389,22 +389,62 @@ static int compare_versions(const char *v1s, const char *v2s) {
 
 /* ── Metadata helpers ──────────────────────────────────────────────────────── */
 
+/* Forward declaration used by metadata readers below. */
+static int json_get_string(const char *json, const char *key, char *out, size_t out_sz);
+
 /*
- * Write a metadata.json for an app into its data directory.
- * Fields: name, version, author, description.
- * All values are taken from the extract_dir/metadata.json if present,
- * otherwise we populate only what we know (name + version from packages list).
+ * Read the package name from extract_dir/metadata.json.
+ * metadata.json and its "name" field are required.
  */
-static void save_metadata(const char *app_name, const char *version,
-                           const char *extract_dir) {
+static int read_metadata_name(const char *extract_dir, char *name_out, size_t name_out_sz) {
+    char src_meta[MAX_PATH];
+    snprintf(src_meta, sizeof(src_meta), "%s%smetadata.json", extract_dir, PATH_SEP);
+
+    FILE *f = fopen(src_meta, "r");
+    if (!f) {
+        fprintf(stderr, "[capp] Error: metadata.json is required in the bundle.\n");
+        return 0;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); fprintf(stderr, "[capp] Error: Could not read metadata.json.\n"); return 0; }
+
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); fprintf(stderr, "[capp] Error: Out of memory reading metadata.json.\n"); return 0; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf);
+        fclose(f);
+        fprintf(stderr, "[capp] Error: Could not read metadata.json.\n");
+        return 0;
+    }
+    fclose(f);
+    buf[sz] = '\0';
+
+    int ok = json_get_string(buf, "name", name_out, name_out_sz);
+    free(buf);
+    if (!ok || name_out[0] == '\0') {
+        fprintf(stderr, "[capp] Error: metadata.json must include a non-empty \"name\" field.\n");
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Copy metadata.json from the extracted bundle to ~/.capp/data/<app_name>/.
+ * metadata.json is required.
+ */
+static int save_metadata(const char *app_name, const char *version,
+                         const char *extract_dir) {
+    (void)version;
     char app_data_dir[MAX_PATH];
-    if (!get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir))) return;
+    if (!get_app_data_dir(app_name, app_data_dir, sizeof(app_data_dir))) return 0;
 
     char cmd[MAX_CMD];
     snprintf(cmd, sizeof(cmd), MKDIR_CMD, app_data_dir);
     system(cmd);
 
-    /* Check if bundle provides its own metadata.json */
     char src_meta[MAX_PATH];
     snprintf(src_meta, sizeof(src_meta), "%s%smetadata.json", extract_dir, PATH_SEP);
     char dst_meta[MAX_PATH];
@@ -413,26 +453,16 @@ static void save_metadata(const char *app_name, const char *version,
     FILE *f = fopen(src_meta, "r");
     if (f) {
         fclose(f);
-        /* Copy provided metadata */
         snprintf(cmd, sizeof(cmd), COPY_CMD, src_meta, dst_meta);
-        if (system(cmd) != 0)
-            fprintf(stderr, "[capp] Warning: Could not copy metadata.json.\n");
-        return;
+        if (system(cmd) != 0) {
+            fprintf(stderr, "[capp] Error: Could not copy metadata.json.\n");
+            return 0;
+        }
+        return 1;
     }
 
-    /* Generate minimal metadata */
-    FILE *out = fopen(dst_meta, "w");
-    if (!out) {
-        fprintf(stderr, "[capp] Warning: Could not write metadata.json.\n");
-        return;
-    }
-    fprintf(out, "{\n");
-    fprintf(out, "  \"name\": \"%s\",\n", app_name);
-    fprintf(out, "  \"version\": \"%s\",\n", version ? version : "unknown");
-    fprintf(out, "  \"author\": \"unknown\",\n");
-    fprintf(out, "  \"description\": \"\"\n");
-    fprintf(out, "}\n");
-    fclose(out);
+    fprintf(stderr, "[capp] Error: metadata.json is required in the bundle.\n");
+    return 0;
 }
 
 /*
@@ -506,7 +536,7 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) {
         printf("[capp] No instructions file found in bundle.\n");
-        if (save_meta) save_metadata(app_name, version, extract_dir);
+        if (save_meta && !save_metadata(app_name, version, extract_dir)) return -1;
         return 0;
     }
     snprintf(found_path, sizeof(found_path), "%s\\%s", extract_dir, fd.cFileName);
@@ -515,7 +545,7 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     DIR *dir = opendir(extract_dir);
     if (!dir) {
         fprintf(stderr, "[capp] Warning: Could not scan bundle directory.\n");
-        if (save_meta) save_metadata(app_name, version, extract_dir);
+        if (save_meta && !save_metadata(app_name, version, extract_dir)) return -1;
         return 0;
     }
     struct dirent *entry;
@@ -529,7 +559,7 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     closedir(dir);
     if (found_path[0] == '\0') {
         printf("[capp] No instructions file found in bundle.\n");
-        if (save_meta) save_metadata(app_name, version, extract_dir);
+        if (save_meta && !save_metadata(app_name, version, extract_dir)) return -1;
         return 0;
     }
 #endif
@@ -550,7 +580,7 @@ static int open_instructions(const char *extract_dir, const char *app_name,
     system(cmd);
 
     /* Save metadata (only during installation, not when fetching for man) */
-    if (save_meta) save_metadata(app_name, version, extract_dir);
+    if (save_meta && !save_metadata(app_name, version, extract_dir)) return -1;
 
     /* Copy instructions */
     snprintf(cached_path, sizeof(cached_path), "%s%s%s",
@@ -1237,7 +1267,7 @@ static int cmd_create(void) {
     strip_trailing_sep(folder);
     if (strlen(folder) == 0) { fprintf(stderr, "Error: Folder path cannot be empty.\n"); return 1; }
 
-    printf("Application name (without .capp): ");
+    printf("Bundle name (without .capp): ");
     if (!fgets(app_name, sizeof(app_name), stdin)) { fprintf(stderr, "Error reading input.\n"); return 1; }
     app_name[strcspn(app_name, "\r\n")] = '\0';
     if (strlen(app_name) == 0) { fprintf(stderr, "Error: Application name cannot be empty.\n"); return 1; }
@@ -1279,12 +1309,6 @@ static int cmd_install_with_version(const char *bundle, const char *version, int
     char app_name[MAX_PATH];
     make_app_name(bundle, app_name, sizeof(app_name));
 
-    if (is_app_installed(app_name)) {
-        fprintf(stderr, "[capp] Error: '%s' is already installed.\n", app_name);
-        fprintf(stderr, "       Use 'capp upgrade %s' or uninstall it first.\n", app_name);
-        return 1;
-    }
-
     char extract_dir[MAX_PATH];
     {
         char rel[MAX_PATH];
@@ -1321,6 +1345,21 @@ static int cmd_install_with_version(const char *bundle, const char *version, int
     VLOG(verbose, "[capp] Extracting bundle...\n");
     if (system(cmd) != 0) { fprintf(stderr, "Error: Extraction failed. Is 'unzip' installed?\n"); return 1; }
 
+    char install_name[MAX_PATH];
+    if (!read_metadata_name(extract_dir, install_name, sizeof(install_name))) {
+        snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
+        system(cmd);
+        return 1;
+    }
+
+    if (is_app_installed(install_name)) {
+        fprintf(stderr, "[capp] Error: '%s' is already installed.\n", install_name);
+        fprintf(stderr, "       Use 'capp upgrade %s' or uninstall it first.\n", install_name);
+        snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
+        system(cmd);
+        return 1;
+    }
+
     if (!review_script(extract_dir, INSTALL_SCRIPT)) {
         printf("[capp] Installation aborted by user.\n");
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
@@ -1338,14 +1377,14 @@ static int cmd_install_with_version(const char *bundle, const char *version, int
         return 1;
     }
 
-    if (open_instructions(extract_dir, app_name, version, 1) != 0) {
+    if (open_instructions(extract_dir, install_name, version, 1) != 0) {
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
         system(cmd);
         return 1;
     }
 
     char dest_path[MAX_PATH];
-    snprintf(dest_path, sizeof(dest_path), "%s%s%s.capp", bundles_dir, PATH_SEP, app_name);
+    snprintf(dest_path, sizeof(dest_path), "%s%s%s.capp", bundles_dir, PATH_SEP, install_name);
     snprintf(cmd, sizeof(cmd), MOVE_CMD, bundle, dest_path);
     VLOG(verbose, "[capp] Storing bundle in: %s\n", dest_path);
     if (system(cmd) != 0) {
@@ -1353,14 +1392,14 @@ static int cmd_install_with_version(const char *bundle, const char *version, int
         fprintf(stderr, "         You may need to move '%s' manually.\n", bundle);
     }
 
-    add_to_installed(app_name);
+    add_to_installed(install_name);
 
     VLOG(verbose, "[capp] Cleaning up...\n");
     snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
     system(cmd);
 
     printf("[capp] Installation complete!\n");
-    VLOG(verbose, "[capp] To uninstall, run: capp uninstall %s\n", app_name);
+    VLOG(verbose, "[capp] To uninstall, run: capp uninstall %s\n", install_name);
 #ifdef _WIN32
     VLOG(verbose, "[capp] Add '%s' to PATH in your PowerShell profile ($PROFILE).\n", bin_dir);
 #else

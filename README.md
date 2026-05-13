@@ -23,7 +23,7 @@ CAPP (Compact App) packages an application and its install/uninstall logic into 
 MyApp.capp  (ZIP archive containing:)
 ├── install.sh / install.bat     — runs on installation
 ├── uninstall.sh / uninstall.bat — runs on uninstallation
-├── metadata.json                — package metadata (optional)
+├── metadata.json                — package metadata (required)
 ├── instructions.<ext>           — usage documentation (optional)
 ├── <main file>                  — source code, binary, etc.
 └── <anything else>
@@ -55,7 +55,7 @@ Any additional string, number, boolean, or array fields are allowed. Arrays are 
 }
 ```
 
-If no `metadata.json` is provided in the bundle, CAPP generates a minimal one with the package name and version populated from the mirror's `packages.txt`.
+`metadata.json` is mandatory for installation. CAPP will refuse to install bundles that do not include it.
 
 ---
 
