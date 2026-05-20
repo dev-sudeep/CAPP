@@ -29,6 +29,7 @@
 
 #ifdef _WIN32
   #include <windows.h>       /* FindFirstFile, _fullpath */
+  #include <direct.h>        /* _getcwd, _chdir */
 
   #define PATH_SEP          "\\"
   #define HOME_ENV          "USERPROFILE"
@@ -162,6 +163,22 @@ static int get_bundles_dir(char *out, size_t out_sz) {
     }
     snprintf(out, out_sz, "%s%s", home, BUNDLES_SUBDIR);
     return 1;
+}
+
+static int get_cwd(char *out, size_t out_sz) {
+#ifdef _WIN32
+    return _getcwd(out, (int)out_sz) != NULL;
+#else
+    return getcwd(out, out_sz) != NULL;
+#endif
+}
+
+static int change_dir(const char *path) {
+#ifdef _WIN32
+    return _chdir(path) == 0;
+#else
+    return chdir(path) == 0;
+#endif
 }
 
 static int get_bin_dir(char *out, size_t out_sz) {
@@ -1367,9 +1384,26 @@ static int cmd_install_with_version(const char *bundle, const char *version, int
         return 1;
     }
 
+    char cwd[MAX_PATH];
+    if (!get_cwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "[capp] Error: Could not read current directory.\n");
+        snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
+        system(cmd);
+        return 1;
+    }
+    if (!change_dir(extract_dir)) {
+        fprintf(stderr, "[capp] Error: Could not enter extraction directory.\n");
+        snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
+        system(cmd);
+        return 1;
+    }
+
     snprintf(cmd, sizeof(cmd), RUN_INSTALL, extract_dir);
     VLOG(verbose, "[capp] Running install script...\n");
     int ret = system(cmd);
+    if (!change_dir(cwd)) {
+        fprintf(stderr, "[capp] Warning: Could not restore working directory to '%s'.\n", cwd);
+    }
     if (ret != 0) {
         fprintf(stderr, "[capp] Install script exited with code %d.\n", ret);
         snprintf(cmd, sizeof(cmd), RMDIR_CMD, extract_dir);
