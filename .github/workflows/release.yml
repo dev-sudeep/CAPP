@@ -1,11 +1,6 @@
 name: Release capp
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'capp.c'
   workflow_dispatch:
     inputs:
       version:
