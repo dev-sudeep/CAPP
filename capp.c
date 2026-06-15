@@ -19,6 +19,7 @@
  *   capp man <AppName>                     — open instructions for an installed app
  *   capp clear-cache                       — remove cached instructions files (keeps metadata)
  */
+// Test release Workflow
 
 #include <stdio.h>
 #include <stdlib.h>
