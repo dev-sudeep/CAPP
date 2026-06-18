@@ -10,7 +10,7 @@ on:
         default: '1.0.0'
 
 jobs:
-  # ── Linux builds (native + cross via gcc multilib / cross toolchains) ──────
+  # ── Linux builds ───────────────────────────────────────────────────────────
   build-linux:
     name: Build Linux (${{ matrix.arch }})
     runs-on: ubuntu-22.04
@@ -20,28 +20,28 @@ jobs:
           - arch: x86_64
             cc: gcc
             cflags: -m64
+            apt_pkgs: gcc
           - arch: x86
             cc: gcc
             cflags: -m32
+            apt_pkgs: gcc-multilib
           - arch: aarch64
             cc: aarch64-linux-gnu-gcc
             cflags: ""
+            apt_pkgs: gcc-aarch64-linux-gnu
           - arch: arm
             cc: arm-linux-gnueabihf-gcc
             cflags: ""
+            apt_pkgs: gcc-arm-linux-gnueabihf
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install cross-compilers
+      - name: Install compiler
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            gcc \
-            gcc-multilib \
-            gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabihf
+          sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
       - name: Compile
         run: |
@@ -53,7 +53,7 @@ jobs:
           name: capp-linux-${{ matrix.arch }}
           path: capp-linux-${{ matrix.arch }}
 
-  # ── macOS builds (native x86_64 + cross-compile aarch64 via clang target) ──
+  # ── macOS builds ───────────────────────────────────────────────────────────
   build-macos:
     name: Build macOS (${{ matrix.arch }})
     runs-on: macos-latest
@@ -79,7 +79,7 @@ jobs:
           name: capp-macos-${{ matrix.arch }}
           path: capp-macos-${{ matrix.arch }}
 
-  # ── Windows builds (x86_64 native, aarch64 via LLVM/clang cross) ───────────
+  # ── Windows builds ─────────────────────────────────────────────────────────
   build-windows:
     name: Build Windows (${{ matrix.arch }})
     runs-on: windows-latest
@@ -112,7 +112,7 @@ jobs:
           name: capp-windows-${{ matrix.arch }}
           path: capp-windows-${{ matrix.arch }}.exe
 
-  # ── Release ─────────────────────────────────────────────────────────────────
+  # ── Release ────────────────────────────────────────────────────────────────
   release:
     name: Create Release
     needs: [build-linux, build-macos, build-windows]
