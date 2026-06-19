@@ -24,7 +24,7 @@ jobs:
           - arch: x86
             cc: gcc
             cflags: -m32
-            apt_pkgs: gcc-multilib
+            apt_pkgs: gcc-12-multilib g++-12-multilib
           - arch: aarch64
             cc: aarch64-linux-gnu-gcc
             cflags: ""
@@ -38,10 +38,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache APT packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ matrix.apt_pkgs }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
       - name: Install compiler
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ${{ matrix.apt_pkgs }}
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_pkgs }}
 
       - name: Compile
         run: |
@@ -112,10 +120,45 @@ jobs:
           name: capp-windows-${{ matrix.arch }}
           path: capp-windows-${{ matrix.arch }}.exe
 
+  # ── Android builds ─────────────────────────────────────────────────────────
+  build-android:
+    name: Build Android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+            api: 24
+          - abi: armeabi-v7a
+            target: armv7a-linux-androideabi
+            api: 24
+          - abi: x86_64
+            target: x86_64-linux-android
+            api: 24
+          - abi: x86
+            target: i686-linux-android
+            api: 24
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Compile
+        run: |
+          CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}${{ matrix.api }}-clang"
+          $CC capp.c -o capp-android-${{ matrix.abi }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capp-android-${{ matrix.abi }}
+          path: capp-android-${{ matrix.abi }}
+
   # ── Release ────────────────────────────────────────────────────────────────
   release:
-    name: Create Release
-    needs: [build-linux, build-macos, build-windows]
+    name: Create or Update Release
+    needs: [build-linux, build-macos, build-windows, build-android]
     runs-on: ubuntu-latest
 
     steps:
@@ -131,18 +174,20 @@ jobs:
       - name: List artifacts (debug)
         run: ls -lh artifacts/
 
-      - name: Create GitHub Release
+      - name: Publish Release Assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "v${{ inputs.version }}" \
-            --title "Release v${{ inputs.version }}" \
-            --notes "Automated release v${{ inputs.version }}" \
-            artifacts/capp-linux-x86_64 \
-            artifacts/capp-linux-x86 \
-            artifacts/capp-linux-aarch64 \
-            artifacts/capp-linux-arm \
-            artifacts/capp-macos-x86_64 \
-            artifacts/capp-macos-aarch64 \
-            artifacts/capp-windows-x86_64.exe \
-            artifacts/capp-windows-aarch64.exe
+          VERSION="v${{ inputs.version }}"
+          
+          # Check if the release already exists
+          if gh release view "$VERSION" > /dev/null 2>&1; then
+            echo "Release $VERSION already exists. Updating assets..."
+            # Upload and overwrite existing files with the same name (--clobber)
+            gh release upload "$VERSION" artifacts/* --clobber
+          else
+            echo "Creating new release $VERSION..."
+            gh release create "$VERSION" artifacts/* \
+              --title "Release $VERSION" \
+              --notes "Automated release $VERSION"
+          fi
