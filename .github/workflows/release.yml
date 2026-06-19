@@ -1,16 +1,4 @@
-name: Release capp
-
-on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Semantic Version (e.g. 1.0.0)'
-        required: true
-        type: string
-        default: '1.0.0'
-
-jobs:
-  # ── Linux builds ───────────────────────────────────────────────────────────
+# ── Linux builds ───────────────────────────────────────────────────────────
   build-linux:
     name: Build Linux (${{ matrix.arch }})
     runs-on: ubuntu-22.04
@@ -20,19 +8,22 @@ jobs:
           - arch: x86_64
             cc: gcc
             cflags: -m64
-            apt_pkgs: gcc
+            apt_pkgs: gcc libc6-dev
           - arch: x86
             cc: gcc
             cflags: -m32
-            apt_pkgs: gcc-12-multilib g++-12-multilib
+            # Lightened down to avoid massive g++ multilib dependencies
+            apt_pkgs: gcc-multilib libc6-dev-i386
           - arch: aarch64
             cc: aarch64-linux-gnu-gcc
             cflags: ""
-            apt_pkgs: gcc-aarch64-linux-gnu
+            # Added explicit cross libc headers
+            apt_pkgs: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           - arch: arm
             cc: arm-linux-gnueabihf-gcc
             cflags: ""
-            apt_pkgs: gcc-arm-linux-gnueabihf
+            # Added explicit cross libc headers
+            apt_pkgs: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
 
     steps:
       - name: Checkout code
@@ -42,13 +33,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ matrix.apt_pkgs }}
+          key: ${{ runner.os }}-apt-${{ matrix.arch }}-${{ hashFiles('**/capp.c') }}
           restore-keys: |
-            ${{ runner.os }}-apt-
+            ${{ runner.os }}-apt-${{ matrix.arch }}-
 
       - name: Install compiler
         run: |
           sudo apt-get update -qq
+          # --no-install-recommends cuts installation sizes in half by dropping documentation
           sudo apt-get install -y --no-install-recommends ${{ matrix.apt_pkgs }}
 
       - name: Compile
@@ -60,134 +52,3 @@ jobs:
         with:
           name: capp-linux-${{ matrix.arch }}
           path: capp-linux-${{ matrix.arch }}
-
-  # ── macOS builds ───────────────────────────────────────────────────────────
-  build-macos:
-    name: Build macOS (${{ matrix.arch }})
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            target: x86_64-apple-macos10.15
-          - arch: aarch64
-            target: arm64-apple-macos11
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Compile
-        run: |
-          clang -target ${{ matrix.target }} capp.c -o capp-macos-${{ matrix.arch }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: capp-macos-${{ matrix.arch }}
-          path: capp-macos-${{ matrix.arch }}
-
-  # ── Windows builds ─────────────────────────────────────────────────────────
-  build-windows:
-    name: Build Windows (${{ matrix.arch }})
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            cc: gcc
-            cflags: -m64
-          - arch: aarch64
-            cc: clang
-            cflags: --target=aarch64-pc-windows-msvc
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install LLVM (for aarch64 cross-compile)
-        if: matrix.arch == 'aarch64'
-        run: choco install llvm --yes
-
-      - name: Compile
-        shell: bash
-        run: |
-          ${{ matrix.cc }} ${{ matrix.cflags }} capp.c -o capp-windows-${{ matrix.arch }}.exe
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: capp-windows-${{ matrix.arch }}
-          path: capp-windows-${{ matrix.arch }}.exe
-
-  # ── Android builds ─────────────────────────────────────────────────────────
-  build-android:
-    name: Build Android (${{ matrix.abi }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - abi: arm64-v8a
-            target: aarch64-linux-android
-            api: 24
-          - abi: armeabi-v7a
-            target: armv7a-linux-androideabi
-            api: 24
-          - abi: x86_64
-            target: x86_64-linux-android
-            api: 24
-          - abi: x86
-            target: i686-linux-android
-            api: 24
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Compile
-        run: |
-          CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}${{ matrix.api }}-clang"
-          $CC capp.c -o capp-android-${{ matrix.abi }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: capp-android-${{ matrix.abi }}
-          path: capp-android-${{ matrix.abi }}
-
-  # ── Release ────────────────────────────────────────────────────────────────
-  release:
-    name: Create or Update Release
-    needs: [build-linux, build-macos, build-windows, build-android]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: List artifacts (debug)
-        run: ls -lh artifacts/
-
-      - name: Publish Release Assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="v${{ inputs.version }}"
-          
-          # Check if the release already exists
-          if gh release view "$VERSION" > /dev/null 2>&1; then
-            echo "Release $VERSION already exists. Updating assets..."
-            # Upload and overwrite existing files with the same name (--clobber)
-            gh release upload "$VERSION" artifacts/* --clobber
-          else
-            echo "Creating new release $VERSION..."
-            gh release create "$VERSION" artifacts/* \
-              --title "Release $VERSION" \
-              --notes "Automated release $VERSION"
-          fi
