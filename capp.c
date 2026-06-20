@@ -6,18 +6,25 @@
  *   Windows     : gcc -o capp.exe capp.c
  *
  * Usage:
- *   capp create                            — interactively bundle a folder into a .capp
- *   capp install   <App.capp>              — install a bundle from local file
- *   capp install-remote <AppName>          — install latest from mirror
- *   capp uninstall <AppName>               — uninstall a previously installed app
- *   capp update                            — refresh available.txt + packages.json, show upgrades
- *   capp upgrade [AppName]                 — upgrade one or all installed packages
- *   capp list                              — list all available packages
- *   capp list-installed                    — list all installed packages
- *   capp search <query>                    — search available and installed packages
- *   capp show <AppName>                    — show full metadata for a package
- *   capp man <AppName>                     — open instructions for an installed app
- *   capp clear-cache                       — remove cached instructions files (keeps metadata)
+ *   capp create                                      — interactively bundle a folder into a .capp
+ *   capp install   <App.capp> [App2.capp ...]        — install one or more bundles from local files
+ *   capp install-remote <AppName> [AppName2 ...]     — install one or more packages from mirror
+ *   capp uninstall <AppName> [AppName2 ...]          — uninstall one or more previously installed apps
+ *   capp remove    <AppName> [AppName2 ...]          — alias for uninstall
+ *   capp update                                      — refresh available.txt + packages.json, show upgrades
+ *   capp upgrade [AppName]                           — upgrade one or all installed packages
+ *   capp list                                        — list all available packages
+ *   capp list-installed                              — list all installed packages
+ *   capp search <query>                              — search available and installed packages
+ *   capp show <AppName>                              — show full metadata for a package
+ *   capp man <AppName>                               — open instructions for an installed app
+ *   capp clear-cache                                 — remove cached instructions files (keeps metadata)
+ *
+ * Notes:
+ *   - install, install-remote, and uninstall/remove all accept multiple
+ *     package names/bundles in a single invocation and process them in order.
+ *   - "remove" is a literal alias for "uninstall" — same behavior, no
+ *     difference in execution, just an alternate name some users expect.
  */
 
 #include <stdio.h>
@@ -41,7 +48,7 @@
   #define ZIP_CMD           "powershell -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force\""
 
   /* install / uninstall shared */
-  #define UNZIP_CMD         "powershell -Command \"Expand-Archive -Path '%s' -DestinationPath '%s' -Force\""
+  #define UNZIP_CMD         "powershell -Command \"tar -xvf '%s' -C '%s'\""
   #define RMDIR_CMD         "rmdir /s /q \"%s\""
   #define MKDIR_CMD         "powershell -Command \"New-Item -ItemType Directory -Force -Path '%s'\" > nul"
   #define MOVE_CMD          "move /Y \"%s\" \"%s\" > nul"
@@ -1176,7 +1183,11 @@ static char* fetch_packages_list(const char *mirror_url) {
     snprintf(cmd, sizeof(cmd), MKDIR_CMD, temp_dir);
     system(cmd);
 
+#ifdef _WIN32
+    if (system("curl --version > nul 2>&1") != 0) {
+#else
     if (system("curl --version > /dev/null 2>&1") != 0) {
+#endif
         fprintf(stderr, "[capp] Error: curl is not installed.\n");
         return NULL;
     }
@@ -1315,7 +1326,7 @@ static int cmd_create(void) {
     return 0;
 }
 
-/* ── Subcommand: install ───────────────────────────────────────────────────── */
+/* ── Subcommand: install (single bundle) ───────────────────────────────────── */
 
 static int cmd_install_with_version(const char *bundle, const char *version, int verbose) {
     if (!has_capp_ext(bundle)) {
@@ -1442,13 +1453,26 @@ static int cmd_install_with_version(const char *bundle, const char *version, int
     return 0;
 }
 
-static int cmd_install(const char *bundle, int verbose) {
+static int cmd_install_one(const char *bundle, int verbose) {
     return cmd_install_with_version(bundle, NULL, verbose);
 }
 
-/* ── Subcommand: install-remote ────────────────────────────────────────────── */
+/* ── Subcommand: install (multi-bundle) ────────────────────────────────────── */
 
-static int cmd_install_remote(const char *pkg_name, const char *pkg_version, int verbose) {
+static int cmd_install(const char **bundles, int count, int verbose) {
+    int ret = 0;
+    for (int i = 0; i < count; i++) {
+        if (count > 1)
+            printf("\n[capp] Installing %d/%d: %s\n", i + 1, count, bundles[i]);
+        int r = cmd_install_one(bundles[i], verbose);
+        if (r != 0) ret = r;
+    }
+    return ret;
+}
+
+/* ── Subcommand: install-remote (single) ───────────────────────────────────── */
+
+static int cmd_install_remote_one(const char *pkg_name, const char *pkg_version, int verbose) {
     char pkg_name_norm[MAX_PATH];
     strncpy(pkg_name_norm, pkg_name, sizeof(pkg_name_norm) - 1);
     pkg_name_norm[sizeof(pkg_name_norm) - 1] = '\0';
@@ -1522,9 +1546,23 @@ static int cmd_install_remote(const char *pkg_name, const char *pkg_version, int
     return ret;
 }
 
-/* ── Subcommand: uninstall ─────────────────────────────────────────────────── */
+/* ── Subcommand: install-remote (multi) ────────────────────────────────────── */
 
-static int cmd_uninstall(const char *arg, int verbose) {
+static int cmd_install_remote(const char **pkg_names, int count,
+                               const char *pkg_version, int verbose) {
+    int ret = 0;
+    for (int i = 0; i < count; i++) {
+        if (count > 1)
+            printf("\n[capp] Installing remote %d/%d: %s\n", i + 1, count, pkg_names[i]);
+        int r = cmd_install_remote_one(pkg_names[i], pkg_version, verbose);
+        if (r != 0) ret = r;
+    }
+    return ret;
+}
+
+/* ── Subcommand: uninstall (single) ────────────────────────────────────────── */
+
+static int cmd_uninstall_one(const char *arg, int verbose) {
     char app_name[MAX_PATH];
     strncpy(app_name, arg, sizeof(app_name) - 1);
     app_name[sizeof(app_name) - 1] = '\0';
@@ -1614,6 +1652,19 @@ static int cmd_uninstall(const char *arg, int verbose) {
 
     printf("[capp] '%s' has been uninstalled.\n", app_name);
     return 0;
+}
+
+/* ── Subcommand: uninstall (multi) ─────────────────────────────────────────── */
+
+static int cmd_uninstall(const char **app_names, int count, int verbose) {
+    int ret = 0;
+    for (int i = 0; i < count; i++) {
+        if (count > 1)
+            printf("\n[capp] Uninstalling %d/%d: %s\n", i + 1, count, app_names[i]);
+        int r = cmd_uninstall_one(app_names[i], verbose);
+        if (r != 0) ret = r;
+    }
+    return ret;
 }
 
 /* ── Subcommand: update ────────────────────────────────────────────────────── */
@@ -1851,7 +1902,7 @@ static int upgrade_single(const char *app_name, const char *available_data, int 
     remove_from_installed(app_name);
 
     /* Now install latest from mirror */
-    return cmd_install_remote(app_name, NULL, verbose);
+    return cmd_install_remote_one(app_name, NULL, verbose);
 }
 
 static int cmd_upgrade(const char *app_name_arg, int verbose) {
@@ -2726,18 +2777,19 @@ static int cmd_clear_cache(void) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s create                                   — bundle a folder into a .capp file\n", prog);
-    fprintf(stderr, "  %s install  [-V] <App.capp>                 — install a .capp bundle\n", prog);
-    fprintf(stderr, "  %s install-remote [-V] [-v <ver>] <AppName> — install from mirror\n", prog);
-    fprintf(stderr, "  %s uninstall [-V] <AppName>                 — uninstall a previously installed app\n", prog);
-    fprintf(stderr, "  %s update [-V]                              — refresh package indexes from mirrors\n", prog);
-    fprintf(stderr, "  %s upgrade [-V] [AppName]                   — upgrade one or all packages\n", prog);
-    fprintf(stderr, "  %s list [-V]                         — list all available packages\n", prog);
-    fprintf(stderr, "  %s list-installed [-V]                      — list all installed packages\n", prog);
-    fprintf(stderr, "  %s search <query>                           — search available and installed packages\n", prog);
-    fprintf(stderr, "  %s show <AppName>                           — show package metadata\n", prog);
-    fprintf(stderr, "  %s man [-V] <AppName>                       — open instructions for a package\n", prog);
-    fprintf(stderr, "  %s clear-cache                              — remove cached instructions files\n", prog);
+    fprintf(stderr, "  %s create                                        — bundle a folder into a .capp file\n", prog);
+    fprintf(stderr, "  %s install  [-V] <App.capp> [App2.capp ...]      — install one or more .capp bundles\n", prog);
+    fprintf(stderr, "  %s install-remote [-V] [-v <ver>] <Name> [...]   — install one or more packages from mirror\n", prog);
+    fprintf(stderr, "  %s uninstall [-V] <AppName> [AppName2 ...]       — uninstall one or more apps\n", prog);
+    fprintf(stderr, "  %s remove    [-V] <AppName> [AppName2 ...]       — alias for uninstall\n", prog);
+    fprintf(stderr, "  %s update [-V]                                   — refresh package indexes from mirrors\n", prog);
+    fprintf(stderr, "  %s upgrade [-V] [AppName]                        — upgrade one or all packages\n", prog);
+    fprintf(stderr, "  %s list [-V]                                     — list all available packages\n", prog);
+    fprintf(stderr, "  %s list-installed [-V]                           — list all installed packages\n", prog);
+    fprintf(stderr, "  %s search <query>                                — search available and installed packages\n", prog);
+    fprintf(stderr, "  %s show <AppName>                                — show package metadata\n", prog);
+    fprintf(stderr, "  %s man [-V] <AppName>                            — open instructions for a package\n", prog);
+    fprintf(stderr, "  %s clear-cache                                   — remove cached instructions files\n", prog);
     fprintf(stderr, "\nFlags:\n");
     fprintf(stderr, "  -V, --verbose   show detailed progress output\n");
     fprintf(stderr, "  -v <version>    (install-remote only) install a specific version\n");
@@ -2756,49 +2808,49 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "install") == 0) {
-        /* Usage: install [-V|--verbose] <App.capp> */
-        const char *bundle_arg = NULL;
-        int verbose = 0;
+        /* Usage: install [-V|--verbose] <App.capp> [App2.capp ...] */
+        const char *bundles[64];
+        int count = 0, verbose = 0;
         for (int i = 2; i < argc; i++) {
             if (is_verbose_flag(argv[i])) verbose = 1;
-            else if (!bundle_arg)          bundle_arg = argv[i];
-            else { fprintf(stderr, "Usage: %s install [-V|--verbose] <App.capp>\n", argv[0]); return 1; }
+            else if (count < 64)          bundles[count++] = argv[i];
         }
-        if (!bundle_arg) { fprintf(stderr, "Usage: %s install [-V|--verbose] <App.capp>\n", argv[0]); return 1; }
-        return cmd_install(bundle_arg, verbose);
+        if (count == 0) { fprintf(stderr, "Usage: %s install [-V|--verbose] <App.capp> [App2.capp ...]\n", argv[0]); return 1; }
+        return cmd_install(bundles, count, verbose);
     }
 
     if (strcmp(subcmd, "install-remote") == 0) {
-        /* Usage: install-remote [-V|--verbose] [-v <version>] <AppName> */
-        const char *pkg_arg = NULL, *ver_arg = NULL;
-        int verbose = 0;
+        /* Usage: install-remote [-V|--verbose] [-v <version>] <AppName> [AppName2 ...] */
+        const char *pkgs[64];
+        int count = 0, verbose = 0;
+        const char *ver_arg = NULL;
         for (int i = 2; i < argc; i++) {
             if (is_verbose_flag(argv[i])) { verbose = 1; }
             else if (is_version_flag(argv[i])) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: -v requires a version argument.\n"); return 1; }
                 ver_arg = argv[++i];
-            } else if (!pkg_arg) { pkg_arg = argv[i]; }
-            else { fprintf(stderr, "Usage: %s install-remote [-V|--verbose] [-v <version>] <AppName>\n", argv[0]); return 1; }
+            } else if (count < 64) { pkgs[count++] = argv[i]; }
         }
-        if (!pkg_arg) { fprintf(stderr, "Usage: %s install-remote [-V|--verbose] [-v <version>] <AppName>\n", argv[0]); return 1; }
-        return cmd_install_remote(pkg_arg, ver_arg, verbose);
+        if (count == 0) { fprintf(stderr, "Usage: %s install-remote [-V|--verbose] [-v <version>] <AppName> [AppName2 ...]\n", argv[0]); return 1; }
+        return cmd_install_remote(pkgs, count, ver_arg, verbose);
     }
 
-    if (strcmp(subcmd, "uninstall") == 0) {
-        /* Usage: uninstall [-V|--verbose] <AppName> */
-        const char *name_arg = NULL;
-        int verbose = 0;
+    /* "remove" is a plain alias for "uninstall" — same handler, same flags,
+       same multi-package behavior; subcmd is only used below for the usage
+       string so the error message matches whichever name the user typed. */
+    if (strcmp(subcmd, "uninstall") == 0 || strcmp(subcmd, "remove") == 0) {
+        /* Usage: uninstall [-V|--verbose] <AppName> [AppName2 ...] */
+        const char *names[64];
+        int count = 0, verbose = 0;
         for (int i = 2; i < argc; i++) {
             if (is_verbose_flag(argv[i])) verbose = 1;
-            else if (!name_arg)            name_arg = argv[i];
-            else { fprintf(stderr, "Usage: %s uninstall [-V|--verbose] <AppName>\n", argv[0]); return 1; }
+            else if (count < 64)           names[count++] = argv[i];
         }
-        if (!name_arg) { fprintf(stderr, "Usage: %s uninstall [-V|--verbose] <AppName>\n", argv[0]); return 1; }
-        return cmd_uninstall(name_arg, verbose);
+        if (count == 0) { fprintf(stderr, "Usage: %s %s [-V|--verbose] <AppName> [AppName2 ...]\n", argv[0], subcmd); return 1; }
+        return cmd_uninstall(names, count, verbose);
     }
 
     if (strcmp(subcmd, "update") == 0) {
-        /* Usage: update [-V|--verbose] */
         int verbose = 0;
         for (int i = 2; i < argc; i++) {
             if (is_verbose_flag(argv[i])) verbose = 1;
@@ -2808,7 +2860,6 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "upgrade") == 0) {
-        /* Usage: upgrade [-V|--verbose] [AppName] */
         const char *name_arg = NULL;
         int verbose = 0;
         for (int i = 2; i < argc; i++) {
@@ -2830,7 +2881,6 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "man") == 0) {
-        /* Usage: man [-V|--verbose] <AppName> */
         const char *name_arg = NULL;
         int verbose = 0;
         for (int i = 2; i < argc; i++) {
@@ -2843,13 +2893,15 @@ int main(int argc, char *argv[]) {
     }
 
     if (strcmp(subcmd, "list") == 0) {
-        if (argc > 3) { fprintf(stderr, "Usage: %s list [--verbose|-V]\n", argv[0]); return 1; }
-        int verbose = is_verbose_flag(argv[2]) || is_verbose_flag(argv[3]);
+        int verbose = 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_verbose_flag(argv[i])) verbose = 1;
+            else { fprintf(stderr, "Usage: %s list [-V|--verbose]\n", argv[0]); return 1; }
+        }
         return cmd_list(verbose);
     }
 
     if (strcmp(subcmd, "list-installed") == 0) {
-        /* Usage: list-installed [-V|--verbose] */
         int verbose = 0;
         for (int i = 2; i < argc; i++) {
             if (is_verbose_flag(argv[i])) verbose = 1;
