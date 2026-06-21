@@ -48,7 +48,10 @@
   #define ZIP_CMD           "powershell -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force\""
 
   /* install / uninstall shared */
-  #define UNZIP_CMD         "powershell -Command \"tar -xvf '%s' -C '%s'\""
+  /* Expand-Archive refuses any source file whose extension isn't .zip, so
+     .capp bundles must be copied to a .zip-suffixed temp file first. The
+     temp copy is removed immediately after extraction. */
+  #define UNZIP_CMD         "powershell -Command \"$t=[System.IO.Path]::GetTempFileName()+'.zip'; Copy-Item -Path '%s' -Destination $t -Force; Expand-Archive -Path $t -DestinationPath '%s' -Force; Remove-Item $t -Force\""
   #define RMDIR_CMD         "rmdir /s /q \"%s\""
   #define MKDIR_CMD         "powershell -Command \"New-Item -ItemType Directory -Force -Path '%s'\" > nul"
   #define MOVE_CMD          "move /Y \"%s\" \"%s\" > nul"
@@ -895,6 +898,39 @@ static int find_pkg_json_obj(const char *packages_json,
 }
 
 /*
+ * Run a curl command, retrying once on failure with the Windows-only
+ * --ssl-revoke-best-effort flag inserted right after "curl".
+ *
+ * This exists because curl on Windows (Schannel backend) can fail an
+ * otherwise-valid TLS connection with CRYPT_E_NO_REVOCATION_CHECK when the
+ * certificate revocation (CRL/OCSP) endpoint is unreachable — common on
+ * corporate networks/VPNs that block that side-channel traffic. This does
+ * NOT weaken certificate validation (hostname, trust chain, expiry are all
+ * still enforced); it only tolerates the revocation *lookup itself* being
+ * unreachable. The strict call is always tried first; the relaxed retry
+ * only fires if that strict call actually failed.
+ *
+ * base_cmd must start with "curl " — the retry is only attempted on
+ * Windows, since the Schannel-specific quirk doesn't apply elsewhere.
+ */
+static int run_curl_with_fallback(const char *base_cmd) {
+    int ret = system(base_cmd);
+#ifdef _WIN32
+    if (ret != 0) {
+        char retry_cmd[MAX_CMD];
+        /* Insert the flag right after "curl " */
+        if (strncmp(base_cmd, "curl ", 5) == 0) {
+            snprintf(retry_cmd, sizeof(retry_cmd), "curl --ssl-revoke-best-effort %s", base_cmd + 5);
+            fprintf(stderr, "[capp] Warning: strict TLS revocation check failed; "
+                            "retrying with --ssl-revoke-best-effort...\n");
+            ret = system(retry_cmd);
+        }
+    }
+#endif
+    return ret;
+}
+
+/*
  * Load packages.json from disk. Returns allocated string or NULL.
  * Caller must free.
  */
@@ -931,13 +967,13 @@ static char* fetch_packages_json(const char *mirror_url) {
 
     snprintf(curl_url, sizeof(curl_url), "%s/packages.json", mirror_url);
 #ifdef _WIN32
-    snprintf(cmd, sizeof(cmd), "curl -s -f -o \"%s\" \"%s\"", temp_file, curl_url);
+    snprintf(cmd, sizeof(cmd), "curl -sS -f -o \"%s\" \"%s\"", temp_file, curl_url);
 #else
-    snprintf(cmd, sizeof(cmd), "curl -s -f -o '%s' '%s'", temp_file, curl_url);
+    snprintf(cmd, sizeof(cmd), "curl -sS -f -o '%s' '%s'", temp_file, curl_url);
 #endif
 
     printf("[capp] Fetching package metadata from: %s\n", mirror_url);
-    if (system(cmd) != 0) {
+    if (run_curl_with_fallback(cmd) != 0) {
         fprintf(stderr, "[capp] Error: packages.json is required but not found on mirror: %s\n"
                "       Mirrors must provide both packages.txt and packages.json.\n", mirror_url);
         return NULL;
@@ -1181,7 +1217,10 @@ static char* fetch_packages_list(const char *mirror_url) {
 #endif
 
     snprintf(cmd, sizeof(cmd), MKDIR_CMD, temp_dir);
-    system(cmd);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "[capp] Error: Could not create '%s'. Check permissions.\n", temp_dir);
+        return NULL;
+    }
 
 #ifdef _WIN32
     if (system("curl --version > nul 2>&1") != 0) {
@@ -1194,15 +1233,15 @@ static char* fetch_packages_list(const char *mirror_url) {
 
     snprintf(curl_url, sizeof(curl_url), "%s/packages.txt", mirror_url);
 #ifdef _WIN32
-    snprintf(cmd, sizeof(cmd), "curl -s -o \"%s\" \"%s\"", temp_file, curl_url);
+    snprintf(cmd, sizeof(cmd), "curl -sS -o \"%s\" \"%s\"", temp_file, curl_url);
 #else
-    snprintf(cmd, sizeof(cmd), "curl -s -o '%s' '%s'", temp_file, curl_url);
+    snprintf(cmd, sizeof(cmd), "curl -sS -o '%s' '%s'", temp_file, curl_url);
 #endif
 
     printf("[capp] Fetching package list from: %s\n", mirror_url);
 
-    if (system(cmd) != 0) {
-        fprintf(stderr, "[capp] Error: Failed to fetch from mirror.\n");
+    if (run_curl_with_fallback(cmd) != 0) {
+        fprintf(stderr, "[capp] Error: Failed to fetch from mirror (see curl output above).\n");
         return NULL;
     }
 
@@ -1251,13 +1290,13 @@ static int download_capp_file(const char *mirror_url,
 
     snprintf(curl_url, sizeof(curl_url), "%s/packages/%s", mirror_url, filename);
 #ifdef _WIN32
-    snprintf(cmd, sizeof(cmd), "curl -s -f -o \"%s\" \"%s\"", dest_path, curl_url);
+    snprintf(cmd, sizeof(cmd), "curl -sS -f -o \"%s\" \"%s\"", dest_path, curl_url);
 #else
-    snprintf(cmd, sizeof(cmd), "curl -s -f -o '%s' '%s'", dest_path, curl_url);
+    snprintf(cmd, sizeof(cmd), "curl -sS -f -o '%s' '%s'", dest_path, curl_url);
 #endif
 
     printf("[capp] Downloading: %s\n", filename);
-    return system(cmd) == 0;
+    return run_curl_with_fallback(cmd) == 0;
 }
 
 /* ── Verbose / flag helpers ───────────────────────────────────────────────── */
